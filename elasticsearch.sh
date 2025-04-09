@@ -32,6 +32,7 @@ fi
 echo "-----------------------------------------"
 echo "📊 Current Memory and Swap Usage:"
 free -h
+sudo systemctl status elasticsearch
 
 echo "-----------------------------------------"
 echo "$es_status"
