@@ -30,9 +30,16 @@ loading_msg() {
     echo "---- Application Folder Sizes ----"
 
     total_size_bytes=0
+    declare -A seen_inodes
 
     for folder in "$APP_DIR"/*/; do
         if [ -d "$folder" ]; then
+            inode=$(stat -c '%d:%i' "$folder")  # device:inode unique identifier
+            if [[ -n "${seen_inodes[$inode]}" ]]; then
+                continue  # Skip duplicate (already seen inode)
+            fi
+            seen_inodes[$inode]=1
+
             size_human=$(du -sh "$folder" 2>/dev/null | cut -f1)
             size_bytes=$(du -sb "$folder" 2>/dev/null | cut -f1)
             folder_name=$(basename "$folder")
