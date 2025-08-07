@@ -48,9 +48,21 @@ loading_msg() {
 
     echo ""
     loading_msg "Calculating total database size"
-    # Use sudo to make sure it has access, and follow symlinks if needed
-    db_size=$(sudo du -shL "$DB_DIR" 2>/dev/null | cut -f1)
-    echo "🗃️ All Database Size (MySQL): $db_size"
+    db_total_bytes=0
+    echo "---- Database Folder Sizes ----"
+    for db_folder in "$DB_DIR"/*/; do
+        if [ -d "$db_folder" ]; then
+            db_size_human=$(du -sh "$db_folder" 2>/dev/null | cut -f1)
+            db_size_bytes=$(du -sb "$db_folder" 2>/dev/null | cut -f1)
+            db_name=$(basename "$db_folder")
+            db_total_bytes=$((db_total_bytes + db_size_bytes))
+            echo "$db_name - $db_size_human"
+        fi
+    done
+
+    db_total_human=$(awk "BEGIN {printf \"%.1fG\", $db_total_bytes/1024/1024/1024}")
+    echo ""
+    echo "🗃️ All Database Size (MySQL): $db_total_human"
 
     echo ""
     loading_msg "Finding top 15 largest directories on the server"
