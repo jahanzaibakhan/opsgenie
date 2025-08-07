@@ -27,18 +27,24 @@ loading_msg() {
     echo ""
 
     loading_msg "Calculating individual application folder sizes"
-    echo "---- Application Folder Sizes in $APP_DIR ----"
+    echo "---- Application Folder Sizes ----"
+
+    total_size_bytes=0
+
     for folder in "$APP_DIR"/*/; do
         if [ -d "$folder" ]; then
-            size=$(du -sh "$folder" 2>/dev/null | cut -f1)
-            echo "$folder - $size"
+            size_human=$(du -sh "$folder" 2>/dev/null | cut -f1)
+            size_bytes=$(du -sb "$folder" 2>/dev/null | cut -f1)
+            folder_name=$(basename "$folder")
+            total_size_bytes=$((total_size_bytes + size_bytes))
+            echo "$folder_name - $size_human"
         fi
     done
 
     echo ""
     loading_msg "Calculating total size of all apps"
-    total_app_size=$(du -sb "$APP_DIR"/*/ 2>/dev/null | awk '{total += $1} END {printf "%.1fG", total/1024/1024/1024}')
-    echo "📦 App File Size (Total): $total_app_size"
+    total_app_size_human=$(awk "BEGIN {printf \"%.1fG\", $total_size_bytes/1024/1024/1024}")
+    echo "📦 App File Size (Total): $total_app_size_human"
 
     echo ""
     loading_msg "Calculating total database size"
