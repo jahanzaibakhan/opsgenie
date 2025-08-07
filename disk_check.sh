@@ -48,7 +48,8 @@ loading_msg() {
 
     echo ""
     loading_msg "Calculating total database size"
-    db_size=$(du -sh "$DB_DIR" 2>/dev/null | cut -f1)
+    # Use sudo to make sure it has access, and follow symlinks if needed
+    db_size=$(sudo du -shL "$DB_DIR" 2>/dev/null | cut -f1)
     echo "🗃️ All Database Size (MySQL): $db_size"
 
     echo ""
