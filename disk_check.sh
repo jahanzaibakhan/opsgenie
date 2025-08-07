@@ -67,8 +67,14 @@ loading_msg() {
         fi
     done
 
-    db_total_human=$(awk "BEGIN {printf \"%.1fG\", $db_total_bytes/1024/1024/1024}")
     echo ""
+    # Format DB size based on value
+    if [ "$db_total_bytes" -ge $((1024 * 1024 * 1024)) ]; then
+        db_total_human=$(awk "BEGIN {printf \"%.1fG\", $db_total_bytes/1024/1024/1024}")
+    else
+        db_total_human=$(awk "BEGIN {printf \"%.1fM\", $db_total_bytes/1024/1024}")
+    fi
+
     echo "All Database Size (MySQL): $db_total_human"
 
     echo ""
