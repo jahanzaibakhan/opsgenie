@@ -44,12 +44,12 @@ loading_msg() {
     echo ""
     loading_msg "Calculating total size of all apps"
     total_app_size_human=$(awk "BEGIN {printf \"%.1fG\", $total_size_bytes/1024/1024/1024}")
-    echo "📦 App File Size (Total): $total_app_size_human"
+    echo "App File Size (Total): $total_app_size_human"
 
     echo ""
     loading_msg "Calculating total database size"
     db_total_bytes=0
-    echo "---- Database Folder Sizes ----"
+    echo "---- Database Sizes ----"
     for db_folder in "$DB_DIR"/*/; do
         if [ -d "$db_folder" ]; then
             db_size_human=$(du -sh "$db_folder" 2>/dev/null | cut -f1)
@@ -62,7 +62,7 @@ loading_msg() {
 
     db_total_human=$(awk "BEGIN {printf \"%.1fG\", $db_total_bytes/1024/1024/1024}")
     echo ""
-    echo "🗃️ All Database Size (MySQL): $db_total_human"
+    echo "All Database Size (MySQL): $db_total_human"
 
     echo ""
     loading_msg "Finding top 15 largest directories on the server"
