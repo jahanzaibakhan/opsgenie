@@ -2,7 +2,6 @@
 
 APPS_PATH="/home/master/applications"
 
-# Convert human-readable size to BYTES (integer only)
 to_bytes() {
     local size="$1"
     local num unit bytes
@@ -22,7 +21,6 @@ to_bytes() {
     echo "$bytes"
 }
 
-# Convert bytes → M/G readable format
 to_readable() {
     local bytes=$1
     if (( bytes >= 1024*1024*1024 )); then
@@ -34,11 +32,9 @@ to_readable() {
     fi
 }
 
-# Table header
 printf "%-20s %-15s %-15s %-15s\n" "DB Name" "File Size" "DB Size" "Total Size"
 printf "%-20s %-15s %-15s %-15s\n" "-------" "---------" "--------" "----------"
 
-# Loop apps
 for APP in $(ls -1 $APPS_PATH); do
     APP_PATH="$APPS_PATH/$APP"
 
@@ -53,16 +49,17 @@ for APP in $(ls -1 $APPS_PATH); do
     FILE_SIZE=$(du -sh "$APP_PATH" 2>/dev/null | awk '{print $1}')
     FILE_BYTES=$(to_bytes "$FILE_SIZE")
 
-    # DB SIZE
-    DB_SIZE=$(sudo apm -s "$DB_NAME" -d 2>/dev/null | grep "Size" | awk '{print $2}')
-    if [[ -z "$DB_SIZE" ]]; then
+    # DB SIZE from /var/lib/mysql
+    DB_PATH="/var/lib/mysql/$DB_NAME"
+    if [[ -d "$DB_PATH" ]]; then
+        DB_SIZE=$(du -sh "$DB_PATH" 2>/dev/null | awk '{print $1}')
+        DB_BYTES=$(to_bytes "$DB_SIZE")
+    else
         DB_SIZE="0"
         DB_BYTES=0
-    else
-        DB_BYTES=$(to_bytes "$DB_SIZE")
     fi
 
-    # SAFE INTEGER TOTAL WITHOUT DECIMAL
+    # TOTAL SIZE
     TOTAL_BYTES=$(( FILE_BYTES + DB_BYTES ))
     TOTAL_SIZE=$(to_readable "$TOTAL_BYTES")
 
