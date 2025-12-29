@@ -40,12 +40,20 @@ for ((i=1;i<=ITERATIONS;i++)); do
     echo -e "\nTCP connections with Send-Q>0: $CONN"
     CONN_SUM+=($CONN)
 
-    # MySQL connections
-    MYSQL_COUNT=$(mysql -e "SHOW FULL PROCESSLIST;" | wc -l)
-    echo -e "\nMySQL active connections: $MYSQL_COUNT"
-    MYSQL_CONN+=($MYSQL_COUNT)
+   # MySQL connections
+MYSQL_COUNT=$(mysql -e "SHOW FULL PROCESSLIST;" | wc -l)
+echo -e "\nMySQL active connections: $MYSQL_COUNT"
+MYSQL_CONN+=($MYSQL_COUNT)
 
-    sleep $INTERVAL
+# === Network connections with Send-Q > 0 (detailed) ===
+echo -e "\nTCP connections with Send-Q>0 (IP:Port Send-Q):"
+ss -tn state established | awk 'NR>1 && $2>0 {print $5, $2}' | cut -d: -f1,2 | sort | uniq -c | sort -nr | tee /tmp/network_sendq_snapshot.txt
+
+# Save number of connections for summary
+CONN=$(wc -l < /tmp/network_sendq_snapshot.txt)
+CONN_SUM+=($CONN)
+
+sleep $INTERVAL
 done
 
 # === Summary / Conclusive report ===
