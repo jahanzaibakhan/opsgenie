@@ -110,21 +110,28 @@ else
 fi
 
 # ===============================
-# STEP 6: INTERACTIVE BACKUP PROMPT
+# STEP 6: INTERACTIVE BACKUP PROMPT (FIXED)
 # ===============================
 echo
 echo -e "${BOLD}▶ Step 6: Backup failed apps interactively${NC}"
 
 for APP in "${ERROR_APPS[@]}"; do
-    read -rp "$(echo -e "Do you want to take backup for ${BOLD}$APP${NC}? [Y/N]: ")" ANSWER
-    ANSWER=$(echo "$ANSWER" | tr '[:upper:]' '[:lower:]')
-    if [[ "$ANSWER" == "y" ]]; then
-        echo -e "${YELLOW}▶ Running backup for $APP...${NC}"
-        sudo "$BACKUP_SCRIPT" -a "$APP"
-        echo -e "${GREEN}✅ Backup completed for $APP${NC}"
-    else
-        echo -e "${YELLOW}⚠️ Skipped backup for $APP${NC}"
-    fi
+    while true; do
+        # Use /dev/tty to force interactive input
+        read -rp "$(echo -e "Do you want to take backup for ${BOLD}$APP${NC}? [Y/N]: ")" ANSWER </dev/tty
+        ANSWER=$(echo "$ANSWER" | tr '[:upper:]' '[:lower:]')
+        if [[ "$ANSWER" == "y" ]]; then
+            echo -e "${YELLOW}▶ Running backup for $APP...${NC}"
+            sudo "$BACKUP_SCRIPT" -a "$APP"
+            echo -e "${GREEN}✅ Backup completed for $APP${NC}"
+            break
+        elif [[ "$ANSWER" == "n" ]]; then
+            echo -e "${YELLOW}⚠️ Skipped backup for $APP${NC}"
+            break
+        else
+            echo -e "${RED}❌ Invalid input. Please enter Y or N.${NC}"
+        fi
+    done
 done
 
 # ===============================
