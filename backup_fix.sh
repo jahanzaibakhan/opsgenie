@@ -5,159 +5,125 @@ CACHE_DIR="/home/.duplicity"
 FACTS_FILE="/etc/ansible/facts.d/backup.fact"
 LOG_FILE="/var/log/backup.log"
 
-# Colors for easier reading
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo -e "${YELLOW}--- Starting Backup Diagnostics & Remediation ---${NC}"
+echo -e "${YELLOW}--- Starting Backup Diagnostics ---${NC}"
 
 # ==============================================================================
-# STEP 1: Cache Cleanup with Path Verification
+# STEP 1: Cache Cleanup (Safe)
 # ==============================================================================
 echo -e "\n${YELLOW}[Step 1] Verifying and Cleaning Duplicity Cache...${NC}"
 
 if [ -d "$CACHE_DIR" ]; then
-    cd "$CACHE_DIR" || { echo -e "${RED}Failed to CD into $CACHE_DIR. Exiting.${NC}"; exit 1; }
-    
-    CURRENT_PATH=$(pwd)
-    
-    if [[ "$CURRENT_PATH" == "$CACHE_DIR" ]]; then
-        echo -e "${GREEN}Path confirmed: $CURRENT_PATH${NC}"
-        echo "Clearing dub cache..."
+    cd "$CACHE_DIR" || exit 1
+    if [[ "$(pwd)" == "$CACHE_DIR" ]]; then
+        echo -e "${GREEN}Path confirmed: $(pwd)${NC}"
         rm -rf ./*
-        echo -e "${GREEN}Cache cleared successfully.${NC}"
+        echo -e "${GREEN}Cache cleared.${NC}"
     else
-        echo -e "${RED}CRITICAL: Current path ($CURRENT_PATH) does not match target ($CACHE_DIR). Aborting delete.${NC}"
+        echo -e "${RED}Path Mismatch. Aborting delete.${NC}"
         exit 1
     fi
 else
-    echo -e "${RED}Directory $CACHE_DIR does not exist. Skipping cleanup.${NC}"
+    echo -e "${RED}Directory $CACHE_DIR not found.${NC}"
 fi
 
 # ==============================================================================
-# STEP 2: Display Raw Content
+# STEP 2: Show Current Status
 # ==============================================================================
-echo -e "\n${YELLOW}[Step 2] Reading Configuration Files${NC}"
+echo -e "\n${YELLOW}[Step 2] Reading Files${NC}"
 echo "----------------------------------------------------"
 
-echo -e "${CYAN}--- Content of $FACTS_FILE ---${NC}"
-if [ -f "$FACTS_FILE" ]; then
-    cat "$FACTS_FILE"
-else
-    echo -e "${RED}File $FACTS_FILE not found!${NC}"
-fi
+echo -e "${CYAN}--- Facts File ---${NC}"
+[ -f "$FACTS_FILE" ] && cat "$FACTS_FILE" || echo "Facts file not found."
 
-echo -e "\n${CYAN}--- Content of $LOG_FILE ---${NC}"
-if [ -f "$LOG_FILE" ]; then
-    cat "$LOG_FILE"
-    LOG_CONTENT=$(cat "$LOG_FILE")
-else
-    echo -e "${RED}File $LOG_FILE not found!${NC}"
-    LOG_CONTENT=""
-fi
+echo -e "\n${CYAN}--- Log File ---${NC}"
+[ -f "$LOG_FILE" ] && cat "$LOG_FILE" || echo "Log file not found."
+
+# Load content for analysis
+FACTS_CONTENT=$(cat "$FACTS_FILE" 2>/dev/null)
+LOG_CONTENT=$(cat "$LOG_FILE" 2>/dev/null)
 
 # ==============================================================================
-# STEP 3: Smart Analysis (Status & Errors)
+# STEP 3: Smart Error Detection
 # ==============================================================================
-echo -e "\n${YELLOW}[Step 3] Analyzing Errors & Status${NC}"
+echo -e "\n${YELLOW}[Step 3] Analyzing for Errors${NC}"
 
-# 1. Detect App Name
-DB_NAME=$(grep -oE "last_backup_[a-z0-9]+" "$FACTS_FILE" | head -n 1 | sed 's/last_backup_//')
+TARGET_DB=""
+ISSUE_FOUND=false
 
-if [ -z "$DB_NAME" ]; then
-    # Fallback: Try to find pattern in log if not in facts
-    DB_NAME=$(echo "$LOG_CONTENT" | grep -oE "\b[a-z0-9]{10,}\b" | head -n 1)
+# 1. Check FACTS file for lines that DO NOT look like a valid date (DD/MM/YYYY)
+# If a line has "last_backup_xyz =" but NO date, it's likely an error code.
+FAILING_LINE=$(grep "last_backup_" "$FACTS_FILE" | grep -vE "[0-9]{2}/[0-9]{2}/[0-9]{4}" | head -n 1)
+
+if [ ! -z "$FAILING_LINE" ]; then
+    echo -e "${RED}>> Error Detected in Facts File:${NC} $FAILING_LINE"
+    TARGET_DB=$(echo "$FAILING_LINE" | grep -oE "last_backup_[a-z0-9]+" | sed 's/last_backup_//')
+    ISSUE_FOUND=true
 fi
 
-echo -e "Detected App/DB Name: ${CYAN}$DB_NAME${NC}"
-
-# 2. Check Specific Status in Facts File
-if [ ! -z "$DB_NAME" ] && [ -f "$FACTS_FILE" ]; then
-    # Extract the exact line for this DB
-    STATUS_LINE=$(grep "last_backup_$DB_NAME" "$FACTS_FILE")
-    echo -e "Facts Status: $STATUS_LINE"
-
-    # Check if the status line looks like a timestamp (Success) or an Error
-    # Assuming success looks like "DD/MM/YYYY..." or just a date string. 
-    # If it contains "Error", "Failed", or "Exit", we flag it.
-    if echo "$STATUS_LINE" | grep -iqE "error|failed|exit|code"; then
-        echo -e "${RED}>> Error Code detected in Facts file.${NC}"
-    else
-        echo -e "${GREEN}>> Facts file shows valid timestamp (No explicit error code in facts).${NC}"
-        echo "   Proceeding to check Logs for deeper issues..."
-    fi
-fi
-
-# 3. Analyze Logs SPECIFICALLY for this App/DB
-# We filter log lines to matches containing the DB_NAME to avoid false positives from other apps.
-APP_LOGS=$(echo "$LOG_CONTENT" | grep "$DB_NAME")
-
-# If no specific logs found for app, check recent general errors
-if [ -z "$APP_LOGS" ]; then
-    echo "No specific log entries found for $DB_NAME. Checking general log tail..."
-    APP_LOGS=$(tail -n 20 "$LOG_FILE")
-fi
-
-# --- Check for Storage Issues ---
-if echo "$APP_LOGS" | grep -iqE "storage|disk|space|write error"; then
-    echo -e "\n${RED}>>> STORAGE ISSUE DETECTED FOR $DB_NAME <<<${NC}"
-    
-    echo -e "Checking Disk Usage:"
-    df -h
-    
-    if [ ! -z "$DB_NAME" ]; then
-        echo -e "Checking App Size:"
-        sudo apm -s "$DB_NAME" -d
-    fi
-fi
-
-# --- Check for Resource Issues (Dump Failed / Memory) ---
-RESTART_REQUIRED=false
-
-if echo "$APP_LOGS" | grep -iqE "dump failed|memory|oom|swap|timeout"; then
-    echo -e "\n${RED}>>> DUMP FAILED / RESOURCE ISSUE DETECTED FOR $DB_NAME <<<${NC}"
-    RESTART_REQUIRED=true
-    
-    echo -e "Checking Resources:"
-    echo -n "Memory: " && free -m | grep "Mem:" | awk '{print $3"/"$2 " MB used"}'
-    echo -n "Swap:   " && free -m | grep "Swap:" | awk '{print $3"/"$2 " MB used"}'
-    echo -n "Load:   " && uptime | awk -F'load average:' '{ print $2 }'
-else
-    echo -e "\n${GREEN}No critical dump/memory errors found in logs for this specific app.${NC}"
-fi
-
-# ==============================================================================
-# STEP 4: Remediation
-# ==============================================================================
-
-if [ "$RESTART_REQUIRED" = true ]; then
-    echo -e "\n${YELLOW}[Step 4] Executing Remediation (Clear Swap & Restart Services)${NC}"
-    
-    echo "Clearing Swap..."
-    sudo swapoff -a && sudo swapon -a
-    
-    echo "Restarting Services..."
-    
-    restart_service() {
-        if systemctl list-unit-files | grep -q "$1.service"; then
-            echo " -> Restarting $1..."
-            sudo systemctl restart "$1"
+# 2. If no facts error, check LOGS for specific keywords associated with a DB
+if [ "$ISSUE_FOUND" = false ]; then
+    if echo "$LOG_CONTENT" | grep -iqE "dump failed|storage|write error"; then
+        # Find the DB name mentioned near the error in the logs
+        # Extracts string matching 10+ alphanumeric chars
+        POTENTIAL_DB=$(echo "$LOG_CONTENT" | grep -oE "\b[a-z0-9]{10,}\b" | head -n 1)
+        
+        if [ ! -z "$POTENTIAL_DB" ]; then
+             TARGET_DB="$POTENTIAL_DB"
+             echo -e "${RED}>> Error Detected in Logs for DB:${NC} $TARGET_DB"
+             ISSUE_FOUND=true
         fi
-    }
+    fi
+fi
 
-    restart_service "apache2"
-    restart_service "nginx"
-    
-    # Auto-detect PHP version
-    PHP_SERVICE=$(systemctl list-units --type=service | grep -o "php.*-fpm.service" | head -n 1)
-    [ ! -z "$PHP_SERVICE" ] && restart_service "$PHP_SERVICE"
+# ==============================================================================
+# STEP 4: Conditional Diagnostics & Remediation
+# ==============================================================================
 
-    restart_service "mysql"
+if [ "$ISSUE_FOUND" = true ] && [ ! -z "$TARGET_DB" ]; then
+    echo -e "\n${YELLOW}[Step 4] Running Diagnostics for $TARGET_DB${NC}"
 
-    echo -e "${GREEN}Remediation complete.${NC}"
+    # -- Storage Check --
+    # Check if the logs specifically mention storage/disk
+    if echo "$LOG_CONTENT" | grep -iqE "storage|disk|space"; then
+        echo -e "${RED}Possible Storage Issue.${NC}"
+        df -h
+        echo "Checking App Size:"
+        sudo apm -s "$TARGET_DB" -d
+    fi
+
+    # -- Resource Check (Memory/Dump) --
+    if echo "$LOG_CONTENT" | grep -iqE "dump failed|memory|oom|swap"; then
+        echo -e "${RED}Dump Failed / Resource Issue Detected.${NC}"
+        
+        echo "--- Resource Status ---"
+        free -m
+        uptime
+        
+        echo -e "\n${YELLOW}[Step 5] Executing Remediation${NC}"
+        echo "Clearing Swap..."
+        sudo swapoff -a && sudo swapon -a
+        
+        echo "Restarting Services..."
+        sudo systemctl restart apache2
+        sudo systemctl restart nginx
+        sudo systemctl restart mysql
+        
+        # PHP Dynamic Restart
+        PHP_SVC=$(systemctl list-units --type=service | grep -o "php.*-fpm.service" | head -n 1)
+        [ ! -z "$PHP_SVC" ] && sudo systemctl restart "$PHP_SVC"
+        
+        echo -e "${GREEN}Remediation Done.${NC}"
+    fi
+
 else
-    echo -e "\n${GREEN}Diagnostics finished. No remediation actions required.${NC}"
+    # HAPPY PATH: No errors found
+    echo -e "\n${GREEN}>> System Healthy: No failed backups or errors detected.${NC}"
+    echo "Skipping diagnostics and remediation."
 fi
