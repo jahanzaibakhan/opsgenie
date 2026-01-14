@@ -58,18 +58,35 @@ if [[ ${#ERROR_APPS[@]} -eq 0 ]]; then
 fi
 
 # ===============================
-# STEP 3: SHOW DB & FILE SIZE FOR EACH FAILED APP
+# STEP 3: SHOW DB & FILE SIZE TABLE FOR EACH FAILED APP (FIXED)
 # ===============================
 echo
-echo -e "${BOLD}▶ Step 3: Checking DB & file sizes for failed apps${NC}"
+echo -e "${BOLD}▶ Step 3: DB & File Sizes for Failed Apps${NC}"
+
+printf "${BOLD}%-20s %-20s %-20s${NC}\n" "App Name" "DB Size" "Files Size"
+printf "%-20s %-20s %-20s\n" "--------" "-------" "----------"
 
 declare -A APP_SIZES
 
 for APP in "${ERROR_APPS[@]}"; do
     echo -e "${BOLD}App: $APP${NC}"
-    SIZE_OUTPUT=$(sudo apm -s "$APP" -d | grep -i "DB Size\|Files Size")
-    APP_SIZES["$APP"]="$SIZE_OUTPUT"
-    echo "$SIZE_OUTPUT"
+    
+    # Run the apm command
+    RAW_OUTPUT=$(sudo apm -s "$APP" -d)
+    
+    # Print raw output for debugging
+    echo "$RAW_OUTPUT"
+    
+    # Extract DB and Files size more flexibly
+    DB_SIZE=$(echo "$RAW_OUTPUT" | grep -iE "DB Size|Database Size" | awk -F: '{print $2}' | xargs)
+    FILE_SIZE=$(echo "$RAW_OUTPUT" | grep -iE "Files Size|Files" | awk -F: '{print $2}' | xargs)
+    
+    # If not found, show N/A
+    [[ -z "$DB_SIZE" ]] && DB_SIZE="N/A"
+    [[ -z "$FILE_SIZE" ]] && FILE_SIZE="N/A"
+    
+    APP_SIZES["$APP"]="DB: $DB_SIZE | Files: $FILE_SIZE"
+    printf "${RED}%-20s${NC} %-20s %-20s\n" "$APP" "$DB_SIZE" "$FILE_SIZE"
 done
 
 # ===============================
