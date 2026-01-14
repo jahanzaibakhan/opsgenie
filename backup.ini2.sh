@@ -58,35 +58,75 @@ if [[ ${#ERROR_APPS[@]} -eq 0 ]]; then
 fi
 
 # ===============================
-# STEP 3: SHOW DB & FILE SIZE TABLE FOR EACH FAILED APP (FIXED)
+# STEP 3: SHOW DB & FILE SIZE TABLE FOR FAILED APPS
 # ===============================
 echo
 echo -e "${BOLD}▶ Step 3: DB & File Sizes for Failed Apps${NC}"
 
-printf "${BOLD}%-20s %-20s %-20s${NC}\n" "App Name" "DB Size" "Files Size"
-printf "%-20s %-20s %-20s\n" "--------" "-------" "----------"
+APPS_PATH="/home/master/applications"
 
-declare -A APP_SIZES
+to_bytes() {
+    local size="$1"
+    local num unit bytes
+
+    num=$(echo "$size" | sed -E 's/([0-9.]+).*/\1/')
+    unit=$(echo "$size" | sed -E 's/[0-9.]+(.*)/\1/' | tr '[:lower:]' '[:upper:]')
+
+    case "$unit" in
+        B|"")   bytes=$(printf "%.0f" "$num") ;;
+        K|KB)   bytes=$(printf "%.0f" "$(echo "$num * 1024" | bc)") ;;
+        M|MB)   bytes=$(printf "%.0f" "$(echo "$num * 1024 * 1024" | bc)") ;;
+        G|GB)   bytes=$(printf "%.0f" "$(echo "$num * 1024 * 1024 * 1024" | bc)") ;;
+        T|TB)   bytes=$(printf "%.0f" "$(echo "$num * 1024 * 1024 * 1024 * 1024" | bc)") ;;
+        *)      bytes=0 ;;
+    esac
+
+    echo "$bytes"
+}
+
+to_readable() {
+    local bytes=$1
+    if (( bytes >= 1024*1024*1024 )); then
+        echo "$(echo "scale=2; $bytes/1024/1024/1024" | bc)G"
+    elif (( bytes >= 1024*1024 )); then
+        echo "$(echo "scale=2; $bytes/1024/1024" | bc)M"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+# Table header
+printf "${BOLD}%-20s %-15s %-15s %-15s${NC}\n" "App Name" "File Size" "DB Size" "Total Size"
+printf "%-20s %-15s %-15s %-15s\n" "--------" "---------" "--------" "----------"
 
 for APP in "${ERROR_APPS[@]}"; do
-    echo -e "${BOLD}App: $APP${NC}"
-    
-    # Run the apm command
-    RAW_OUTPUT=$(sudo apm -s "$APP" -d)
-    
-    # Print raw output for debugging
-    echo "$RAW_OUTPUT"
-    
-    # Extract DB and Files size more flexibly
-    DB_SIZE=$(echo "$RAW_OUTPUT" | grep -iE "DB Size|Database Size" | awk -F: '{print $2}' | xargs)
-    FILE_SIZE=$(echo "$RAW_OUTPUT" | grep -iE "Files Size|Files" | awk -F: '{print $2}' | xargs)
-    
-    # If not found, show N/A
-    [[ -z "$DB_SIZE" ]] && DB_SIZE="N/A"
-    [[ -z "$FILE_SIZE" ]] && FILE_SIZE="N/A"
-    
-    APP_SIZES["$APP"]="DB: $DB_SIZE | Files: $FILE_SIZE"
-    printf "${RED}%-20s${NC} %-20s %-20s\n" "$APP" "$DB_SIZE" "$FILE_SIZE"
+    APP_PATH="$APPS_PATH/$APP"
+
+    # Skip if app folder missing
+    if [[ ! -d "$APP_PATH" ]]; then
+        FILE_SIZE="N/A"
+        FILE_BYTES=0
+    else
+        FILE_SIZE=$(du -sh "$APP_PATH" 2>/dev/null | awk '{print $1}')
+        FILE_BYTES=$(to_bytes "$FILE_SIZE")
+    fi
+
+    # DB size
+    DB_PATH="/var/lib/mysql/$APP"
+    if [[ -d "$DB_PATH" ]]; then
+        DB_SIZE=$(du -sh "$DB_PATH" 2>/dev/null | awk '{print $1}')
+        DB_BYTES=$(to_bytes "$DB_SIZE")
+    else
+        DB_SIZE="0"
+        DB_BYTES=0
+    fi
+
+    # Total
+    TOTAL_BYTES=$(( FILE_BYTES + DB_BYTES ))
+    TOTAL_SIZE=$(to_readable "$TOTAL_BYTES")
+
+    # Print table row
+    printf "${RED}%-20s${NC} %-15s %-15s %-15s\n" "$APP" "$FILE_SIZE" "$DB_SIZE" "$TOTAL_SIZE"
 done
 
 # ===============================
