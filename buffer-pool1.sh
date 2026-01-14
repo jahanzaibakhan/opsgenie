@@ -49,8 +49,8 @@ echo -e "Current Buffer Pool Size: ${YELLOW}${CURRENT_BP_MB} MB${NC}"
 # ===============================
 echo -e "\n${BOLD}📊 Step 3: CPU & Memory Status${NC}"
 
-CPU_IDLE=$(top -bn1 | awk '/Cpu/ {print $8}')
-CPU_USAGE=$(printf "%.0f" "$(echo "100 - $CPU_IDLE" | bc)")
+CPU_USAGE=$(top -bn1 | awk -F',' '/Cpu/ {print 100 - $4}' | awk '{printf "%.0f\n",$1}')
+[[ -z "$CPU_USAGE" ]] && CPU_USAGE="N/A"
 
 echo -e "CPU Usage : ${YELLOW}${CPU_USAGE}%${NC}"
 
@@ -62,12 +62,18 @@ free -h
 # ===============================
 echo -e "\n${BOLD}📝 Step 4: Recommendation${NC}"
 
-if (( CURRENT_BP_MB > IDEAL_BP_MB )); then
-    echo -e "${RED}${BOLD}⚠️ Buffer pool is OVER-ALLOCATED${NC}"
+DIFF=$(( IDEAL_BP_MB - CURRENT_BP_MB ))
+ABS_DIFF=${DIFF#-}
+
+if (( ABS_DIFF <= 10 )); then
+    echo -e "${GREEN}${BOLD}✅ Buffer pool is already optimal${NC}"
+    NEEDS_CHANGE=false
 elif (( CURRENT_BP_MB < IDEAL_BP_MB )); then
     echo -e "${YELLOW}${BOLD}ℹ️ Buffer pool can be safely increased${NC}"
+    NEEDS_CHANGE=true
 else
-    echo -e "${GREEN}${BOLD}✅ Buffer pool is already optimal${NC}"
+    echo -e "${RED}${BOLD}⚠️ Buffer pool is over-allocated${NC}"
+    NEEDS_CHANGE=true
 fi
 
 echo -e "Recommended Buffer Pool Size: ${GREEN}${IDEAL_BP_MB} MB${NC}"
@@ -75,6 +81,11 @@ echo -e "Recommended Buffer Pool Size: ${GREEN}${IDEAL_BP_MB} MB${NC}"
 # ===============================
 # Step 5: Ask for confirmation
 # ===============================
+if [[ "$NEEDS_CHANGE" != true ]]; then
+    echo -e "${GREEN}✔ No change required. Exiting.${NC}"
+    exit 0
+fi
+
 read -rp "$(echo -e ${BOLD}Do you want to set innodb_buffer_pool_size to ${IDEAL_BP_MB}MB? [Y/N]:${NC} )" CONFIRM
 
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
@@ -114,8 +125,8 @@ systemctl restart mysql
 
 sleep 3
 
-NEW_BP=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
-NEW_BP_MB=$(( NEW_BP / 1024 / 1024 ))
+NEW_BP_BYTES=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
+NEW_BP_MB=$(( NEW_BP_BYTES / 1024 / 1024 ))
 
 echo -e "${GREEN}✅ MySQL restarted successfully${NC}"
 echo -e "New Buffer Pool Size: ${GREEN}${NEW_BP_MB} MB${NC}"
