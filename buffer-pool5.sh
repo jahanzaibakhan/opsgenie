@@ -29,13 +29,13 @@ echo -e "Total RAM      : ${GREEN}${TOTAL_RAM_MB} MB${NC}"
 echo -e "Ideal BP (40%) : ${GREEN}${IDEAL_BP_MB} MB${NC}"
 
 # -------------------------------
-# Step 2: Current Buffer Pool Size
+# Step 2: Current Buffer Pool Size in MySQL
 # -------------------------------
 CURRENT_BP_BYTES=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" 2>/dev/null | awk '{print $2}')
 CURRENT_BP_MB=$(( CURRENT_BP_BYTES / 1024 / 1024 ))
 
 echo -e "\n${BOLD}🗄️ Step 2: Current MySQL Buffer Pool${NC}"
-echo -e "Current Buffer Pool Size: ${YELLOW}${CURRENT_BP_MB} MB${NC}"
+echo -e "Current Buffer Pool Size (from MySQL): ${YELLOW}${CURRENT_BP_MB} MB${NC}"
 
 # -------------------------------
 # Step 3: CPU & Memory Status
@@ -66,7 +66,8 @@ echo -e "Recommended Buffer Pool Size: ${GREEN}${IDEAL_BP_MB} MB${NC}"
 # -------------------------------
 # Step 5: Ask for confirmation
 # -------------------------------
-read -rp "$(echo -e ${BOLD}Apply this change to /etc/mysql/conf.d/custom.cnf? [Y/N]:${NC} )" CONFIRM < /dev/tty
+CONFIG_FILE="/etc/mysql/conf.d/custom.cnf"
+read -rp "$(echo -e ${BOLD}Apply this change to $CONFIG_FILE? [Y/N]:${NC} )" CONFIRM < /dev/tty
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo -e "${YELLOW}⚠️ No changes applied. Exiting.${NC}"
     exit 0
@@ -75,8 +76,6 @@ fi
 # -------------------------------
 # Step 6: Update buffer pool in custom.cnf
 # -------------------------------
-CONFIG_FILE="/etc/mysql/conf.d/custom.cnf"
-
 if grep -q "^innodb_buffer_pool_size" "$CONFIG_FILE"; then
     sed -i "s/^innodb_buffer_pool_size.*/innodb_buffer_pool_size = ${IDEAL_BP_MB}M/" "$CONFIG_FILE"
 else
@@ -92,10 +91,12 @@ echo -e "\n${BOLD}🔄 Restarting MySQL...${NC}"
 systemctl restart mysql
 sleep 3
 
-NEW_BP_BYTES=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" 2>/dev/null | awk '{print $2}')
-NEW_BP_MB=$(( NEW_BP_BYTES / 1024 / 1024 ))
+# -------------------------------
+# Step 8: Show new buffer pool size from file
+# -------------------------------
+NEW_BP_MB=$(grep -i "innodb_buffer_pool_size" "$CONFIG_FILE" | awk -F'=' '{gsub(/M| /,"",$2); print $2}')
+echo -e "${GREEN}✅ New Buffer Pool Size (from file): ${NEW_BP_MB} MB${NC}"
 
-echo -e "${GREEN}✅ New Buffer Pool Size: ${NEW_BP_MB} MB${NC}"
 echo -e "${BOLD}==============================================${NC}"
 echo -e "${GREEN}${BOLD}✔ Optimization Completed Successfully${NC}"
 echo -e "${BOLD}==============================================${NC}"
