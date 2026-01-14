@@ -81,7 +81,7 @@ fi
 # ===============================
 # Step 6: Apply configuration
 # ===============================
-MYSQL_CONF="/etc/mysql/mysql.conf.d/mysqld.cnf"
+MYSQL_CONF="/etc/mysql/conf.d/custom.cnf"
 BACKUP_CONF="${MYSQL_CONF}.bak.$(date +%F_%T)"
 
 if [[ ! -f "$MYSQL_CONF" ]]; then
