@@ -27,17 +27,12 @@ echo -e "${BOLD}==================================================${NC}"
 # ===============================
 echo
 echo -e "${BOLD}▶ Step 0: Verifying duplicity cache path${NC}"
-
 cd "$DUPLICITY_PATH" 2>/dev/null || { echo -e "${RED}❌ Failed to cd into $DUPLICITY_PATH${NC}"; exit 1; }
-
 CURRENT_PATH=$(pwd)
 echo "Current path: $CURRENT_PATH"
-
 if [[ "$CURRENT_PATH" != "$DUPLICITY_PATH" ]]; then
-    echo -e "${RED}❌ PATH VERIFICATION FAILED — ABORTING${NC}"
-    exit 1
+    echo -e "${RED}❌ PATH VERIFICATION FAILED — ABORTING${NC}"; exit 1
 fi
-
 echo -e "${GREEN}✅ PATH CONFIRMED${NC}"
 echo -e "${YELLOW}🧹 Clearing duplicity cache (files only)${NC}"
 find "$DUPLICITY_PATH" -type f -exec rm -f {} \;
@@ -58,8 +53,7 @@ echo -e "${BOLD}▶ Step 2: Backup Facts File${NC}"
 if [[ -f "$FACTS_FILE" ]]; then
     cat "$FACTS_FILE"
 else
-    echo -e "${RED}❌ Facts file not found: $FACTS_FILE${NC}"
-    exit 1
+    echo -e "${RED}❌ Facts file not found: $FACTS_FILE${NC}"; exit 1
 fi
 
 # ===============================
@@ -75,7 +69,7 @@ while IFS='=' read -r KEY VALUE; do
     if [[ "$KEY" =~ ^error_code_ ]]; then
         APP_NAME="${KEY#error_code_}"
         ERROR_APPS+=("$APP_NAME")
-        if [[ "$VALUE" == "40" ]]; then
+        if [[ "$VALUE" -ge 40 ]]; then
             DISK_ERROR_APPS+=("$APP_NAME")
             echo -e "${RED}${BOLD}⚠️ Disk-related error: $APP_NAME (error_code=$VALUE)${NC}"
         else
@@ -108,9 +102,18 @@ echo -e "${BOLD}▶ Step 5: Backup Log Analysis${NC}"
 LOG_DISK_ERROR=false
 LOG_DUMP_ERROR=false
 
-if grep -Ei "no space|disk full|storage" "$BACKUP_LOG" >/dev/null; then
-    LOG_DISK_ERROR=true
-    echo -e "${RED}${BOLD}⚠️ Storage-related error detected in backup log${NC}"
+# Detect "Temp space has ... backup needs ..." lines
+TEMP_DISK_ISSUE_APPS=()
+while read -r LINE; do
+    if [[ "$LINE" =~ ([a-z0-9]+)\ error:\ Temp\ space\ has.*backup\ needs ]]; then
+        APP_NAME="${BASH_REMATCH[1]}"
+        TEMP_DISK_ISSUE_APPS+=("$APP_NAME")
+        LOG_DISK_ERROR=true
+    fi
+done < "$BACKUP_LOG"
+
+if [[ "$LOG_DISK_ERROR" == true ]]; then
+    echo -e "${RED}${BOLD}⚠️ Disk-related issues detected in backup log${NC}"
 fi
 
 if grep -Ei "dump failed|mysqldump" "$BACKUP_LOG" >/dev/null; then
@@ -122,27 +125,29 @@ if [[ "$LOG_DISK_ERROR" == false && "$LOG_DUMP_ERROR" == false ]]; then
     echo -e "${GREEN}✅ No critical storage or dump errors found in backup log${NC}"
 fi
 
+# Merge apps from facts and log for disk issues
+ALL_DISK_APPS=("${DISK_ERROR_APPS[@]}" "${TEMP_DISK_ISSUE_APPS[@]}")
+
 # ===============================
 # STEP 6: APP SIZE SCAN (DISK ERRORS ONLY)
 # ===============================
 echo
-echo -e "${BOLD}▶ Step 6: Application Size Scan (if disk issue)${NC}"
+echo -e "${BOLD}▶ Step 6: Application Size Scan${NC}"
 
 APP_SIZE_SUMMARY=()
-FREE_DISK=$(df -h / | awk 'NR==2 {print $4}')  # root free disk
+FREE_DISK=$(df -h / | awk 'NR==2 {print $4}')  # free disk on root
 
-if [[ ${#DISK_ERROR_APPS[@]} -gt 0 || "$LOG_DISK_ERROR" == true ]]; then
+if [[ ${#ALL_DISK_APPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}⚠️ Disk-related issues found — scanning app sizes${NC}"
-
-    for APP in "${DISK_ERROR_APPS[@]}"; do
+    for APP in "${ALL_DISK_APPS[@]}"; do
         echo
         echo -e "${BOLD}▶ App: $APP${NC}"
-        APP_SIZE=$(sudo apm -s "$APP" -d | grep -i "DB Size\|Files Size")  # capture size
+        APP_SIZE=$(sudo apm -s "$APP" -d | grep -i "DB Size\|Files Size")
         echo "$APP_SIZE"
         APP_SIZE_SUMMARY+=("$APP: $APP_SIZE")
     done
 else
-    echo -e "${GREEN}✅ No disk-related app errors — skipping app size scan${NC}"
+    echo -e "${GREEN}✅ No disk-related app errors — skipping size scan${NC}"
 fi
 
 # ===============================
@@ -154,10 +159,8 @@ echo -e "${BOLD}▶ Step 7: CPU, Memory & Swap Check${NC}"
 if [[ "$LOG_DUMP_ERROR" == true ]]; then
     echo -e "${YELLOW}▶ CPU usage snapshot${NC}"
     top -b -n1 | head -15
-
     echo -e "${YELLOW}▶ Memory usage${NC}"
     free -m
-
     echo -e "${YELLOW}▶ Swap usage${NC}"
     swapon --show
 else
@@ -173,7 +176,7 @@ echo -e "${BOLD}▶ Step 8: Summary${NC}"
 echo -e "${BOLD}==================================================${NC}"
 
 if [[ ${#APP_SIZE_SUMMARY[@]} -gt 0 ]]; then
-    echo -e "${RED}${BOLD}⚠️ Issue caused by the following apps (size may be contributing to disk issue):${NC}"
+    echo -e "${RED}${BOLD}⚠️ Issue caused by the following apps (size may contribute to disk issue):${NC}"
     for APP_SUM in "${APP_SIZE_SUMMARY[@]}"; do
         echo -e "${RED}$APP_SUM${NC}"
     done
