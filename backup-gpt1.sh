@@ -18,7 +18,7 @@ BACKUP_LOG="/var/log/backup.log"
 DATE=$(date '+%Y-%m-%d %H:%M:%S')
 
 echo -e "${BOLD}==================================================${NC}"
-echo -e "${BOLD} Backup Error Detection & Storage Diagnosis Script${NC}"
+echo -e "${BOLD} Backup Error & Disk Diagnosis Script${NC}"
 echo -e "${BOLD} Executed at: $DATE${NC}"
 echo -e "${BOLD}==================================================${NC}"
 
@@ -28,10 +28,7 @@ echo -e "${BOLD}==================================================${NC}"
 echo
 echo -e "${BOLD}▶ Step 0: Verifying duplicity cache path${NC}"
 
-cd "$DUPLICITY_PATH" 2>/dev/null || {
-    echo -e "${RED}❌ Failed to cd into $DUPLICITY_PATH${NC}"
-    exit 1
-}
+cd "$DUPLICITY_PATH" 2>/dev/null || { echo -e "${RED}❌ Failed to cd into $DUPLICITY_PATH${NC}"; exit 1; }
 
 CURRENT_PATH=$(pwd)
 echo "Current path: $CURRENT_PATH"
@@ -43,28 +40,21 @@ fi
 
 echo -e "${GREEN}✅ PATH CONFIRMED${NC}"
 echo -e "${YELLOW}🧹 Clearing duplicity cache (files only)${NC}"
-
 find "$DUPLICITY_PATH" -type f -exec rm -f {} \;
-
 echo -e "${GREEN}✅ Duplicity cache cleared safely${NC}"
 
 # ===============================
 # STEP 1: SHOW DISK USAGE (ALWAYS)
 # ===============================
 echo
-echo -e "${BOLD}==================================================${NC}"
-echo -e "${BOLD}▶ Step 1: Disk Usage (df -h)${NC}"
-echo -e "${BOLD}==================================================${NC}"
+echo -e "${BOLD}▶ Step 1: Disk Usage${NC}"
 df -h
 
 # ===============================
 # STEP 2: READ BACKUP FACTS FILE
 # ===============================
 echo
-echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD}▶ Step 2: Backup Facts File${NC}"
-echo -e "${BOLD}==================================================${NC}"
-
 if [[ -f "$FACTS_FILE" ]]; then
     cat "$FACTS_FILE"
 else
@@ -76,9 +66,7 @@ fi
 # STEP 3: DETECT ERRORS FROM FACTS
 # ===============================
 echo
-echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD}▶ Step 3: Detecting Application Errors${NC}"
-echo -e "${BOLD}==================================================${NC}"
 
 ERROR_APPS=()
 DISK_ERROR_APPS=()
@@ -87,7 +75,6 @@ while IFS='=' read -r KEY VALUE; do
     if [[ "$KEY" =~ ^error_code_ ]]; then
         APP_NAME="${KEY#error_code_}"
         ERROR_APPS+=("$APP_NAME")
-
         if [[ "$VALUE" == "40" ]]; then
             DISK_ERROR_APPS+=("$APP_NAME")
             echo -e "${RED}${BOLD}⚠️ Disk-related error: $APP_NAME (error_code=$VALUE)${NC}"
@@ -105,10 +92,7 @@ fi
 # STEP 4: BACKUP LOG OUTPUT
 # ===============================
 echo
-echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD}▶ Step 4: Backup Log Output${NC}"
-echo -e "${BOLD}==================================================${NC}"
-
 if [[ -f "$BACKUP_LOG" ]]; then
     cat "$BACKUP_LOG"
 else
@@ -119,9 +103,7 @@ fi
 # STEP 5: ANALYZE BACKUP LOG
 # ===============================
 echo
-echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD}▶ Step 5: Backup Log Analysis${NC}"
-echo -e "${BOLD}==================================================${NC}"
 
 LOG_DISK_ERROR=false
 LOG_DUMP_ERROR=false
@@ -144,9 +126,10 @@ fi
 # STEP 6: APP SIZE SCAN (DISK ERRORS ONLY)
 # ===============================
 echo
-echo -e "${BOLD}==================================================${NC}"
-echo -e "${BOLD}▶ Step 6: Application Size Scan${NC}"
-echo -e "${BOLD}==================================================${NC}"
+echo -e "${BOLD}▶ Step 6: Application Size Scan (if disk issue)${NC}"
+
+APP_SIZE_SUMMARY=()
+FREE_DISK=$(df -h / | awk 'NR==2 {print $4}')  # root free disk
 
 if [[ ${#DISK_ERROR_APPS[@]} -gt 0 || "$LOG_DISK_ERROR" == true ]]; then
     echo -e "${YELLOW}⚠️ Disk-related issues found — scanning app sizes${NC}"
@@ -154,29 +137,27 @@ if [[ ${#DISK_ERROR_APPS[@]} -gt 0 || "$LOG_DISK_ERROR" == true ]]; then
     for APP in "${DISK_ERROR_APPS[@]}"; do
         echo
         echo -e "${BOLD}▶ App: $APP${NC}"
-        sudo apm -s "$APP" -d
+        APP_SIZE=$(sudo apm -s "$APP" -d | grep -i "DB Size\|Files Size")  # capture size
+        echo "$APP_SIZE"
+        APP_SIZE_SUMMARY+=("$APP: $APP_SIZE")
     done
 else
-    echo -e "${GREEN}✅ No disk-related app errors — skipping size scan${NC}"
+    echo -e "${GREEN}✅ No disk-related app errors — skipping app size scan${NC}"
 fi
 
 # ===============================
 # STEP 7: CPU / MEMORY / SWAP (DUMP FAIL)
 # ===============================
 echo
-echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD}▶ Step 7: CPU, Memory & Swap Check${NC}"
-echo -e "${BOLD}==================================================${NC}"
 
 if [[ "$LOG_DUMP_ERROR" == true ]]; then
     echo -e "${YELLOW}▶ CPU usage snapshot${NC}"
     top -b -n1 | head -15
 
-    echo
     echo -e "${YELLOW}▶ Memory usage${NC}"
     free -m
 
-    echo
     echo -e "${YELLOW}▶ Swap usage${NC}"
     swapon --show
 else
@@ -184,17 +165,26 @@ else
 fi
 
 # ===============================
-# STEP 8: FINAL DISK AVAILABILITY
+# STEP 8: FINAL SUMMARY
 # ===============================
 echo
 echo -e "${BOLD}==================================================${NC}"
-echo -e "${BOLD}▶ Step 8: Final Disk Availability Summary${NC}"
+echo -e "${BOLD}▶ Step 8: Summary${NC}"
 echo -e "${BOLD}==================================================${NC}"
 
-echo -e "${BOLD}Filesystem\tSize\tUsed\tAvail\tUse%\tMounted on${NC}"
-df -h | awk 'NR==1 || $NF ~ /^\/$/ || $NF ~ /^\/home$/ {print}'
+if [[ ${#APP_SIZE_SUMMARY[@]} -gt 0 ]]; then
+    echo -e "${RED}${BOLD}⚠️ Issue caused by the following apps (size may be contributing to disk issue):${NC}"
+    for APP_SUM in "${APP_SIZE_SUMMARY[@]}"; do
+        echo -e "${RED}$APP_SUM${NC}"
+    done
+    echo
+    echo -e "${YELLOW}💾 Current free storage on root: $FREE_DISK${NC}"
+else
+    echo -e "${GREEN}✅ No disk issue apps found${NC}"
+    echo -e "${GREEN}💾 Current free storage on root: $FREE_DISK${NC}"
+fi
 
 echo
 echo -e "${BOLD}==================================================${NC}"
-echo -e "${BOLD}✔ Script execution completed successfully${NC}"
+echo -e "${BOLD}✔ Script execution completed${NC}"
 echo -e "${BOLD}==================================================${NC}"
