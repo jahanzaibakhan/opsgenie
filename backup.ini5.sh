@@ -14,6 +14,7 @@ NC='\033[0m'          # No Color
 # ===============================
 FACTS_FILE="/etc/ansible/facts.d/backup.fact"
 BACKUP_SCRIPT="/var/cw/scripts/bash/duplicity_backup.sh"
+APPS_PATH="/home/master/applications"
 
 echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD} Backup & Disk Recovery Script${NC}"
@@ -58,20 +59,13 @@ if [[ ${#ERROR_APPS[@]} -eq 0 ]]; then
 fi
 
 # ===============================
-# STEP 3: SHOW DB & FILE SIZE TABLE FOR FAILED APPS
+# FUNCTIONS TO CONVERT SIZE
 # ===============================
-echo
-echo -e "${BOLD}▶ Step 3: DB & File Sizes for Failed Apps${NC}"
-
-APPS_PATH="/home/master/applications"
-
 to_bytes() {
     local size="$1"
     local num unit bytes
-
     num=$(echo "$size" | sed -E 's/([0-9.]+).*/\1/')
     unit=$(echo "$size" | sed -E 's/[0-9.]+(.*)/\1/' | tr '[:lower:]' '[:upper:]')
-
     case "$unit" in
         B|"")   bytes=$(printf "%.0f" "$num") ;;
         K|KB)   bytes=$(printf "%.0f" "$(echo "$num * 1024" | bc)") ;;
@@ -80,7 +74,6 @@ to_bytes() {
         T|TB)   bytes=$(printf "%.0f" "$(echo "$num * 1024 * 1024 * 1024 * 1024" | bc)") ;;
         *)      bytes=0 ;;
     esac
-
     echo "$bytes"
 }
 
@@ -95,14 +88,21 @@ to_readable() {
     fi
 }
 
-# Table header
+# ===============================
+# STEP 3: SHOW DB & FILE SIZE TABLE FOR FAILED APPS
+# ===============================
+echo
+echo -e "${BOLD}▶ Step 3: DB & File Sizes for Failed Apps${NC}"
+
 printf "${BOLD}%-20s %-15s %-15s %-15s${NC}\n" "App Name" "File Size" "DB Size" "Total Size"
 printf "%-20s %-15s %-15s %-15s\n" "--------" "---------" "--------" "----------"
+
+declare -A APP_TOTAL_BYTES  # Store total size per app
 
 for APP in "${ERROR_APPS[@]}"; do
     APP_PATH="$APPS_PATH/$APP"
 
-    # Skip if app folder missing
+    # File size
     if [[ ! -d "$APP_PATH" ]]; then
         FILE_SIZE="N/A"
         FILE_BYTES=0
@@ -125,7 +125,9 @@ for APP in "${ERROR_APPS[@]}"; do
     TOTAL_BYTES=$(( FILE_BYTES + DB_BYTES ))
     TOTAL_SIZE=$(to_readable "$TOTAL_BYTES")
 
-    # Print table row
+    APP_TOTAL_BYTES["$APP"]=$TOTAL_BYTES  # Store for Step 6
+
+    # Print row
     printf "${RED}%-20s${NC} %-15s %-15s %-15s\n" "$APP" "$FILE_SIZE" "$DB_SIZE" "$TOTAL_SIZE"
 done
 
@@ -141,7 +143,6 @@ echo -e "${YELLOW}CPU Usage: $CPU_USAGE%${NC}"
 
 if [[ "$CPU_USAGE" -gt 70 ]]; then
     echo -e "${RED}${BOLD}⚠️ CPU is above 70%, restarting services...${NC}"
-    echo -e "${YELLOW}Stopping apache2, nginx, php-fpm, mysql...${NC}"
     sudo systemctl restart apache2 nginx php-fpm mysql
     echo -e "${GREEN}✅ Services restarted successfully${NC}"
 else
@@ -173,8 +174,9 @@ echo
 echo -e "${BOLD}▶ Step 6: Backup failed apps interactively${NC}"
 
 for APP in "${ERROR_APPS[@]}"; do
-    # Skip apps with total size 0 or missing
-    TOTAL_BYTES=$(( ${FILE_BYTES:-0} + ${DB_BYTES:-0} ))
+    TOTAL_BYTES=${APP_TOTAL_BYTES["$APP"]}
+
+    # Skip apps with total size 0
     if [[ "$TOTAL_BYTES" -eq 0 ]]; then
         echo -e "${YELLOW}⚠️ Skipping backup prompt for $APP (File+DB size = 0)${NC}"
         continue
