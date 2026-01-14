@@ -24,11 +24,10 @@ if [ -d "$DUPLICITY_CACHE" ]; then
     cd "$DUPLICITY_CACHE" || { echo -e "${RED}❌ Cannot cd to $DUPLICITY_CACHE${NC}"; exit 1; }
     echo -e "${GREEN}✔ Path confirmed: $(pwd)${NC}"
     
-    # Only remove files inside the folder, not the folder itself
+    # Only remove files inside the folder
     rm -rf ./* 2>/dev/null
     echo -e "${GREEN}✅ Duplicity cache cleared.${NC}"
     
-    # Return to original path
     cd "$CURRENT_PATH"
 else
     echo -e "${RED}⚠️ Duplicity cache directory not found.${NC}"
@@ -51,14 +50,17 @@ ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -n 6
 # ===============================
 # Step 3: Show and highlight errors from backup.fact
 # ===============================
-echo -e "\n${BOLD}🗂️ Step 3: Highlighting errors from backup facts${NC}"
+echo -e "\n${BOLD}🗂️ Step 3: Detecting failed apps from facts file${NC}"
 FACT_FILE="/etc/ansible/facts.d/backup.fact"
 DISK_ERROR_FOUND=false
+ERROR_APPS=()
 
 if [ -f "$FACT_FILE" ]; then
     while IFS= read -r line; do
         if echo "$line" | grep -qi "error"; then
             echo -e "${RED}🔴 $line${NC}"
+            APP_NAME=$(echo "$line" | awk -F'=' '{print $1}' | sed 's/error_code_//')
+            ERROR_APPS+=("$APP_NAME")
             if echo "$line" | grep -qiE "disk|storage"; then
                 DISK_ERROR_FOUND=true
             fi
@@ -101,9 +103,75 @@ echo -e "\n${BOLD}💾 Step 5: Disk Usage${NC}"
 df -h
 
 # ===============================
-# Step 6: Report Remarks
+# Step 6: Show Failed Apps DB/File Sizes
 # ===============================
-echo -e "\n${BOLD}📝 Step 6: Report Remarks${NC}"
+echo -e "\n${BOLD}📦 Step 6: Failed Apps DB & File Sizes${NC}"
+
+APPS_PATH="/home/master/applications"
+declare -A APP_TOTAL_BYTES
+
+to_bytes() {
+    local size="$1"
+    local num unit bytes
+    num=$(echo "$size" | sed -E 's/([0-9.]+).*/\1/')
+    unit=$(echo "$size" | sed -E 's/[0-9.]+(.*)/\1/' | tr '[:lower:]' '[:upper:]')
+    case "$unit" in
+        B|"")   bytes=$(printf "%.0f" "$num") ;;
+        K|KB)   bytes=$(printf "%.0f" "$(echo "$num * 1024" | bc)") ;;
+        M|MB)   bytes=$(printf "%.0f" "$(echo "$num * 1024 * 1024" | bc)") ;;
+        G|GB)   bytes=$(printf "%.0f" "$(echo "$num * 1024 * 1024 * 1024" | bc)") ;;
+        T|TB)   bytes=$(printf "%.0f" "$(echo "$num * 1024 * 1024 * 1024 * 1024" | bc)") ;;
+        *)      bytes=0 ;;
+    esac
+    echo "$bytes"
+}
+
+to_readable() {
+    local bytes=$1
+    if (( bytes >= 1024*1024*1024 )); then
+        echo "$(echo "scale=2; $bytes/1024/1024/1024" | bc)G"
+    elif (( bytes >= 1024*1024 )); then
+        echo "$(echo "scale=2; $bytes/1024/1024" | bc)M"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+printf "${BOLD}%-20s %-15s %-15s %-15s${NC}\n" "App Name" "File Size" "DB Size" "Total Size"
+printf "%-20s %-15s %-15s %-15s\n" "--------" "---------" "--------" "----------"
+
+for APP in "${ERROR_APPS[@]}"; do
+    APP_PATH_FULL="$APPS_PATH/$APP"
+
+    if [[ -d "$APP_PATH_FULL" ]]; then
+        FILE_SIZE=$(du -sh "$APP_PATH_FULL" 2>/dev/null | awk '{print $1}')
+        FILE_BYTES=$(to_bytes "$FILE_SIZE")
+    else
+        FILE_SIZE="N/A"
+        FILE_BYTES=0
+    fi
+
+    DB_PATH="/var/lib/mysql/$APP"
+    if [[ -d "$DB_PATH" ]]; then
+        DB_SIZE=$(du -sh "$DB_PATH" 2>/dev/null | awk '{print $1}')
+        DB_BYTES=$(to_bytes "$DB_SIZE")
+    else
+        DB_SIZE="0"
+        DB_BYTES=0
+    fi
+
+    TOTAL_BYTES=$(( FILE_BYTES + DB_BYTES ))
+    TOTAL_SIZE=$(to_readable "$TOTAL_BYTES")
+
+    APP_TOTAL_BYTES["$APP"]=$TOTAL_BYTES
+
+    printf "${RED}%-20s${NC} %-15s %-15s %-15s\n" "$APP" "$FILE_SIZE" "$DB_SIZE" "$TOTAL_SIZE"
+done
+
+# ===============================
+# Step 7: Report Remarks
+# ===============================
+echo -e "\n${BOLD}📝 Step 7: Report Remarks${NC}"
 if [ "$DISK_ERROR_FOUND" = true ]; then
     echo -e "${RED}${BOLD}⚠️ Disk/storage related errors found.${NC}"
     echo -e "🔹 Check backup.fact and backup.log for details."
