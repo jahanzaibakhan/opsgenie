@@ -167,14 +167,20 @@ else
 fi
 
 # ===============================
-# STEP 6: INTERACTIVE BACKUP PROMPT (FIXED)
+# STEP 6: INTERACTIVE BACKUP PROMPT (SKIP EMPTY APPS)
 # ===============================
 echo
 echo -e "${BOLD}▶ Step 6: Backup failed apps interactively${NC}"
 
 for APP in "${ERROR_APPS[@]}"; do
+    # Skip apps with total size 0 or missing
+    TOTAL_BYTES=$(( ${FILE_BYTES:-0} + ${DB_BYTES:-0} ))
+    if [[ "$TOTAL_BYTES" -eq 0 ]]; then
+        echo -e "${YELLOW}⚠️ Skipping backup prompt for $APP (File+DB size = 0)${NC}"
+        continue
+    fi
+
     while true; do
-        # Use /dev/tty to force interactive input
         read -rp "$(echo -e "Do you want to take backup for ${BOLD}$APP${NC}? [Y/N]: ")" ANSWER </dev/tty
         ANSWER=$(echo "$ANSWER" | tr '[:upper:]' '[:lower:]')
         if [[ "$ANSWER" == "y" ]]; then
