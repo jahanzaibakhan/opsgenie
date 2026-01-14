@@ -72,35 +72,37 @@ else
     echo -e "${RED}❌ File not found: $FACT_FILE${NC}"
 fi
 
-# ===============================
-# Step 4: Check and highlight errors from backup.log
-# ===============================
-echo -e "\n${BOLD}📄 Step 4: Checking backup.log for errors${NC}"
-LOG_FILE="/var/log/backup.log"
-if [ -f "$LOG_FILE" ]; then
-    FOUND_ERRORS=false
-    while IFS= read -r line; do
-        if echo "$line" | grep -qi "error"; then
-            echo -e "${RED}🔴 $line${NC}"
-            FOUND_ERRORS=true
-            if echo "$line" | grep -qiE "disk|storage"; then
+# Inside Step 4: backup.log processing
+
+while IFS= read -r line; do
+    if echo "$line" | grep -qi "error"; then
+        echo -e "${RED}🔴 $line${NC}"
+        FOUND_ERRORS=true
+
+        # Check for temp space issue (disk-related)
+        if [[ "$line" =~ Temp\ space\ has\ ([0-9]+)\ available,\ backup\ needs\ approx\ ([0-9]+) ]]; then
+            AVAILABLE=${BASH_REMATCH[1]}
+            NEEDED=${BASH_REMATCH[2]}
+            if (( AVAILABLE < NEEDED )); then
                 DISK_ERROR_FOUND=true
             fi
         fi
-    done < "$LOG_FILE"
 
-    if [ "$FOUND_ERRORS" = false ]; then
-        echo -e "${GREEN}✅ No error lines found in backup.log.${NC}"
+        # Optional: literal disk/storage keywords
+        if echo "$line" | grep -qiE "disk|storage"; then
+            DISK_ERROR_FOUND=true
+        fi
     fi
-else
-    echo -e "${RED}❌ File not found: $LOG_FILE${NC}"
-fi
+done < "$LOG_FILE"
 
-# ===============================
-# Step 5: Show Disk Usage
-# ===============================
-echo -e "\n${BOLD}💾 Step 5: Disk Usage${NC}"
-df -h
+# Step 5: Check disk usage and warn if >90%
+while read -r FS SIZE USED AVAIL USEP MOUNT; do
+    USEP_NUM=$(echo "$USEP" | tr -d '%')
+    if (( USEP_NUM >= 90 )); then
+        echo -e "${RED}${BOLD}⚠️ Filesystem $FS mounted on $MOUNT is critically full (${USEP})${NC}"
+        DISK_ERROR_FOUND=true
+    fi
+done < <(df -h --output=source,size,used,avail,pcent,target | tail -n +2)
 
 # ===============================
 # Step 6: Show Failed Apps DB/File Sizes
