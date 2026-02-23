@@ -5,17 +5,15 @@ printf "%-15s %-12s %-12s\n" "---------" "--------" "---------"
 
 for SERVER in "$@"; do
 
-    DISK=$(cng $SERVER <<EOF 2>/dev/null | tail -1 | awk '{print $5}'
+    OUTPUT=$(cng $SERVER <<EOF 2>/dev/null
 df -h /
-exit
-EOF
-)
-
-    INODE=$(cng $SERVER <<EOF 2>/dev/null | tail -1 | awk '{print $5}'
 df -i /
 exit
 EOF
 )
+
+    DISK=$(echo "$OUTPUT" | grep -Eo '[0-9]+%' | head -1)
+    INODE=$(echo "$OUTPUT" | grep -Eo '[0-9]+%' | tail -1)
 
     printf "%-15s %-12s %-12s\n" "$SERVER" "${DISK:-N/A}" "${INODE:-N/A}"
 
