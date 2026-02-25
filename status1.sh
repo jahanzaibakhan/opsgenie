@@ -29,7 +29,6 @@ NC='\033[0m' # No Color
 SERVER_HOST=""
 SERVER_USER="root"
 SERVER_PORT="22"
-SSH_KEY="~/.ssh/id_rsa"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -42,10 +41,6 @@ while [[ $# -gt 0 ]]; do
             SERVER_PORT="$2"
             shift 2
             ;;
-        --key)
-            SSH_KEY="$2"
-            shift 2
-            ;;
         --help)
             echo "Usage: bash check.sh <SERVER_IP> [OPTIONS]"
             echo ""
@@ -55,7 +50,6 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --user USER      SSH username (default: root)"
             echo "  --port PORT      SSH port (default: 22)"
-            echo "  --key PATH       Path to SSH private key (default: ~/.ssh/id_rsa)"
             echo "  --help           Show this help message"
             echo ""
             echo "Examples:"
@@ -105,9 +99,7 @@ check_status() {
 
 # Function to execute commands on remote server
 execute_remote() {
-    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
-        -i "${SSH_KEY}" -p "${SERVER_PORT}" \
-        "${SERVER_USER}@${SERVER_HOST}" "$@" 2>/dev/null
+    ssh -p "${SERVER_PORT}" "${SERVER_USER}@${SERVER_HOST}" "$@"
 }
 
 # Main status check function
@@ -127,7 +119,7 @@ run_health_check() {
         echo "Please check:"
         echo "  - Server IP/hostname is correct: ${SERVER_HOST}"
         echo "  - SSH port is correct: ${SERVER_PORT}"
-        echo "  - SSH key exists: ${SSH_KEY}"
+        echo "  - Username is correct: ${SERVER_USER}"
         echo "  - You have network access to the server"
         exit 1
     fi
