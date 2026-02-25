@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # Server Health Check Script
-# Usage: bash check.sh 64.176.172.223
+# Usage: 
+#   bash check.sh 64.176.172.223
+#   curl -s https://raw.githubusercontent.com/user/repo/status.sh | bash -s 64.176.172.223
 
 SERVER_IP="$1"
 
@@ -17,10 +19,8 @@ echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "=========================================="
 echo ""
 
-# Create temp script that will run on the remote server
-TMPFILE="/tmp/check_$RANDOM.sh"
-
-cat > "$TMPFILE" << 'REMOTEEOF'
+# Direct cng command with heredoc
+cng "$SERVER_IP" << 'REMOTEEOF'
 #!/bin/bash
 
 echo "========== SYSTEM UPTIME =========="
@@ -92,9 +92,3 @@ echo ""
 
 echo "========== COMPLETED =========="
 REMOTEEOF
-
-# Use cng to connect and pipe the script
-cng "$SERVER_IP" < "$TMPFILE"
-
-# Clean up
-rm -f "$TMPFILE"
