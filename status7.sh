@@ -19,8 +19,8 @@ echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "=========================================="
 echo ""
 
-# Direct cng command with heredoc
-cng "$SERVER_IP" << 'REMOTEEOF'
+# Use ssh to connect and run commands
+ssh -o StrictHostKeyChecking=no root@"$SERVER_IP" << 'REMOTEEOF'
 #!/bin/bash
 
 echo "========== SYSTEM UPTIME =========="
