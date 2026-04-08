@@ -173,73 +173,31 @@ fi
 echo
 echo -e "${BOLD}▶ Step 6: Backup failed apps interactively${NC}"
 
-ELIGIBLE_APPS=()
-
 for APP in "${ERROR_APPS[@]}"; do
     TOTAL_BYTES=${APP_TOTAL_BYTES["$APP"]}
+
+    # Skip apps with total size 0
     if [[ "$TOTAL_BYTES" -eq 0 ]]; then
         echo -e "${YELLOW}⚠️ Skipping backup prompt for $APP (File+DB size = 0)${NC}"
-    else
-        ELIGIBLE_APPS+=("$APP")
+        continue
     fi
-done
 
-if [[ ${#ELIGIBLE_APPS[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}⚠️ No failed apps with backup data found.${NC}"
-elif [[ ${#ELIGIBLE_APPS[@]} -gt 2 ]]; then
     while true; do
-        read -rp "$(echo -e "More than 2 failed apps found (${#ELIGIBLE_APPS[@]} apps). Take backup for ${BOLD}all${NC} failed apps now? [Y/N]: ")" BACKUP_ALL </dev/tty
-        BACKUP_ALL=$(echo "$BACKUP_ALL" | tr '[:upper:]' '[:lower:]')
-
-        if [[ "$BACKUP_ALL" == "y" ]]; then
-            for APP in "${ELIGIBLE_APPS[@]}"; do
-                echo -e "${YELLOW}▶ Running backup for $APP...${NC}"
-                sudo "$BACKUP_SCRIPT" -a "$APP"
-                echo -e "${GREEN}✅ Backup completed for $APP${NC}"
-            done
+        read -rp "$(echo -e "Do you want to take backup for ${BOLD}$APP${NC}? [Y/N]: ")" ANSWER </dev/tty
+        ANSWER=$(echo "$ANSWER" | tr '[:upper:]' '[:lower:]')
+        if [[ "$ANSWER" == "y" ]]; then
+            echo -e "${YELLOW}▶ Running backup for $APP...${NC}"
+            sudo "$BACKUP_SCRIPT" -a "$APP"
+            echo -e "${GREEN}✅ Backup completed for $APP${NC}"
             break
-        elif [[ "$BACKUP_ALL" == "n" ]]; then
-            for APP in "${ELIGIBLE_APPS[@]}"; do
-                while true; do
-                    read -rp "$(echo -e "Do you want to take backup for ${BOLD}$APP${NC}? [Y/N]: ")" ANSWER </dev/tty
-                    ANSWER=$(echo "$ANSWER" | tr '[:upper:]' '[:lower:]')
-                    if [[ "$ANSWER" == "y" ]]; then
-                        echo -e "${YELLOW}▶ Running backup for $APP...${NC}"
-                        sudo "$BACKUP_SCRIPT" -a "$APP"
-                        echo -e "${GREEN}✅ Backup completed for $APP${NC}"
-                        break
-                    elif [[ "$ANSWER" == "n" ]]; then
-                        echo -e "${YELLOW}⚠️ Skipped backup for $APP${NC}"
-                        break
-                    else
-                        echo -e "${RED}❌ Invalid input. Please enter Y or N.${NC}"
-                    fi
-                done
-            done
+        elif [[ "$ANSWER" == "n" ]]; then
+            echo -e "${YELLOW}⚠️ Skipped backup for $APP${NC}"
             break
         else
             echo -e "${RED}❌ Invalid input. Please enter Y or N.${NC}"
         fi
     done
-else
-    for APP in "${ELIGIBLE_APPS[@]}"; do
-        while true; do
-            read -rp "$(echo -e "Do you want to take backup for ${BOLD}$APP${NC}? [Y/N]: ")" ANSWER </dev/tty
-            ANSWER=$(echo "$ANSWER" | tr '[:upper:]' '[:lower:]')
-            if [[ "$ANSWER" == "y" ]]; then
-                echo -e "${YELLOW}▶ Running backup for $APP...${NC}"
-                sudo "$BACKUP_SCRIPT" -a "$APP"
-                echo -e "${GREEN}✅ Backup completed for $APP${NC}"
-                break
-            elif [[ "$ANSWER" == "n" ]]; then
-                echo -e "${YELLOW}⚠️ Skipped backup for $APP${NC}"
-                break
-            else
-                echo -e "${RED}❌ Invalid input. Please enter Y or N.${NC}"
-            fi
-        done
-    done
-fi
+done
 
 # ===============================
 # STEP 7: SHOW NEW BACKUP STATUS FROM FACTS FILE
