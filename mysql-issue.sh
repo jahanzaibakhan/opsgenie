@@ -10,7 +10,9 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 divider() { echo -e "${CYAN}--------------------------------------------------------------${NC}"; }
 header()  { echo -e "\n${BOLD}${GREEN}>>> $1${NC}"; divider; }
-safe_int() { echo "${1//[^0-9]/}" | grep -o '[0-9]*' | head -1; echo 0; } # always returns integer
+
+# Safe integer — strips everything non-numeric, returns 0 if empty
+toint() { local v; v=$(echo "$1" | tr -cd '0-9'); echo "${v:-0}"; }
 
 echo -e "\n${BOLD}========================================================${NC}"
 echo -e "${BOLD}      MySQL / MariaDB Diagnostic Report v2${NC}"
@@ -19,13 +21,10 @@ echo -e "${BOLD}========================================================${NC}"
 
 # ── 1. Debian OS ──────────────────────────────────────────────
 header "Debian OS"
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
+[ -f /etc/os-release ] && { . /etc/os-release
     echo -e "  OS      : ${BOLD}$PRETTY_NAME${NC}"
-    echo -e "  Version : $VERSION_ID ($VERSION_CODENAME)"
-else
-    echo "  /etc/os-release not found"
-fi
+    echo -e "  Version : $VERSION_ID ($VERSION_CODENAME)"; } \
+  || echo "  /etc/os-release not found"
 
 # ── 2. Kernel Version ─────────────────────────────────────────
 header "Kernel Version"
@@ -33,24 +32,24 @@ echo -e "  ${BOLD}$(uname -r)${NC}  ($(uname -m))"
 
 # ── 3. Server Provider ────────────────────────────────────────
 header "Server Provider"
-PROVIDER=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "Unknown")
-PRODUCT=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
+PROVIDER=$(cat /sys/class/dmi/id/sys_vendor  2>/dev/null || echo "Unknown")
+PRODUCT=$( cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
 REGION=$(curl -s --max-time 3 http://169.254.169.254/metadata/v1/region 2>/dev/null \
       || curl -s --max-time 3 http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null \
       || echo "N/A")
-HOSTNAME_META=$(curl -s --max-time 3 http://169.254.169.254/metadata/v1/hostname 2>/dev/null || hostname)
+HMETA=$(curl -s --max-time 3 http://169.254.169.254/metadata/v1/hostname 2>/dev/null || hostname)
 echo -e "  Provider : ${BOLD}$PROVIDER${NC} ($PRODUCT)"
 echo -e "  Region   : $REGION"
-echo -e "  Hostname : $HOSTNAME_META"
+echo -e "  Hostname : $HMETA"
 echo -e "  IP       : $(hostname -I | awk '{print $1}')"
 
 # ── 4. Server Creation / Boot ─────────────────────────────────
 header "Server Creation / Boot Info"
 BOOT_TIME=$(who -b 2>/dev/null | awk '{print $3, $4}')
-OLDEST_DPKG=$(ls -lt --full-time /var/log/dpkg.log* 2>/dev/null | tail -1 | awk '{print $6, $7}' | cut -d'.' -f1)
-echo -e "  Last Boot     : ${BOLD}${BOOT_TIME} UTC${NC}"
-echo -e "  Uptime        : $(uptime -p 2>/dev/null || uptime)"
-echo -e "  Oldest dpkg   : $OLDEST_DPKG (approx. server creation date)"
+OLDEST_DPKG=$(ls -lt --full-time /var/log/dpkg.log* 2>/dev/null | tail -1 | awk '{print $6,$7}' | cut -d'.' -f1)
+echo -e "  Last Boot   : ${BOLD}${BOOT_TIME} UTC${NC}"
+echo -e "  Uptime      : $(uptime -p 2>/dev/null || uptime)"
+echo -e "  Oldest dpkg : $OLDEST_DPKG (approx. server creation date)"
 
 # ── 5. MariaDB / MySQL Version ────────────────────────────────
 header "MariaDB / MySQL Version"
@@ -65,18 +64,15 @@ else
     echo "  MySQL/MariaDB not found"
 fi
 
-# ── 6. Last Patching Call (General + MySQL-specific) ──────────
+# ── 6. Last Patching Call (System + MySQL-specific) ───────────
 header "Last Patching Call"
-
 echo -e "  ${BOLD}Last 5 system upgrade/install entries:${NC}"
-grep -E " upgrade | install " /var/log/dpkg.log 2>/dev/null | tail -5 | while read -r line; do
-    echo "  $line"
-done
+grep -E " upgrade | install " /var/log/dpkg.log 2>/dev/null | tail -5 \
+  | while read -r l; do echo "  $l"; done
 
 echo ""
-echo -e "  ${BOLD}MySQL/MariaDB specific patching history:${NC}"
-# Search current and rotated dpkg logs for mysql/mariadb entries
-MYSQL_PATCH=""
+echo -e "  ${BOLD}MySQL/MariaDB specific patching history (all dpkg logs):${NC}"
+MYSQL_FOUND=0
 for dpkglog in /var/log/dpkg.log /var/log/dpkg.log.1 /var/log/dpkg.log.2.gz /var/log/dpkg.log.3.gz; do
     [ -f "$dpkglog" ] || continue
     if [[ "$dpkglog" == *.gz ]]; then
@@ -86,23 +82,21 @@ for dpkglog in /var/log/dpkg.log /var/log/dpkg.log.1 /var/log/dpkg.log.2.gz /var
     fi
     if [ -n "$LINES" ]; then
         echo "  [$(basename "$dpkglog")]"
-        echo "$LINES" | while read -r line; do echo "    $line"; done
-        MYSQL_PATCH="$LINES"
+        echo "$LINES" | while read -r l; do echo "    $l"; done
+        MYSQL_FOUND=1
     fi
 done
-[ -z "$MYSQL_PATCH" ] && echo "  No MySQL/MariaDB patching entries found in dpkg logs"
+[ "$MYSQL_FOUND" -eq 0 ] && echo "  No MySQL/MariaDB patching entries found in any dpkg log"
 
 # ── 7. Memory & Swap ──────────────────────────────────────────
 header "Memory & Swap"
 free -h | awk '
-  NR==1 {printf "  %-10s %8s %8s %8s %8s %12s\n",$1,$2,$3,$4,$5,$6}
-  NR==2 {printf "  %-10s %8s %8s %8s %8s %12s\n",$1,$2,$3,$4,$5,$6}
-  NR==3 {printf "  %-10s %8s %8s %8s\n",$1,$2,$3,$4}
-'
+  NR==1{printf "  %-10s %8s %8s %8s %8s %12s\n",$1,$2,$3,$4,$5,$6}
+  NR==2{printf "  %-10s %8s %8s %8s %8s %12s\n",$1,$2,$3,$4,$5,$6}
+  NR==3{printf "  %-10s %8s %8s %8s\n",$1,$2,$3,$4}'
 echo ""
-SWAP_TOTAL=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
-SWAP_FREE=$( awk '/SwapFree/ {print $2}' /proc/meminfo)
-SWAP_TOTAL=${SWAP_TOTAL:-0}; SWAP_FREE=${SWAP_FREE:-0}
+SWAP_TOTAL=$(awk '/SwapTotal/{print $2}' /proc/meminfo); SWAP_TOTAL=$(toint "$SWAP_TOTAL")
+SWAP_FREE=$( awk '/SwapFree/ {print $2}' /proc/meminfo); SWAP_FREE=$( toint "$SWAP_FREE")
 if [ "$SWAP_TOTAL" -gt 0 ]; then
     SWAP_USED=$(( SWAP_TOTAL - SWAP_FREE ))
     SWAP_PCT=$((  SWAP_USED * 100 / SWAP_TOTAL ))
@@ -119,10 +113,9 @@ fi
 header "Running Processes (Top 15 by CPU)"
 printf "  %-8s %-12s %5s %5s  %s\n" "PID" "USER" "CPU%" "MEM%" "COMMAND"
 divider
-ps aux --sort=-%cpu | awk 'NR>1 && NR<=16 {
-    cmd=$11; if(length(cmd)>55) cmd=substr(cmd,1,55)"..."
-    printf "  %-8s %-12s %5s %5s  %s\n",$2,$1,$3,$4,cmd
-}'
+ps aux --sort=-%cpu | awk 'NR>1&&NR<=16{
+    cmd=$11; if(length(cmd)>55)cmd=substr(cmd,1,55)"..."
+    printf "  %-8s %-12s %5s %5s  %s\n",$2,$1,$3,$4,cmd}'
 
 # ── 9. MySQL Crash History + Restart Count ────────────────────
 header "MySQL Crash History (from Monit Logs)"
@@ -133,38 +126,41 @@ FIRST_CRASH_LOG=""
 FIRST_CRASH_MSG=""
 
 parse_monit_log() {
-    local logfile="$1"
-    local label="$2"
-    local content
+    local logfile="$1" label="$2"
+    local restarts=0 lines=0 first_crash="" first_crash_time=""
 
+    # Check readable
     if [[ "$logfile" == *.gz ]]; then
-        content=$(zcat "$logfile" 2>/dev/null)
+        zcat "$logfile" &>/dev/null || { echo -e "  ${BOLD}$label${NC}: (unreadable)"; return; }
     else
-        content=$(cat "$logfile" 2>/dev/null)
+        [ -r "$logfile" ] || { echo -e "  ${BOLD}$label${NC}: (unreadable)"; return; }
     fi
-    [ -z "$content" ] && { echo -e "  ${BOLD}$label${NC}: (unreadable/empty)"; return; }
 
-    # FIX: use grep -c carefully — strip whitespace, never use || echo 0
-    # (grep -c returns exit 1 on 0 matches but still prints "0" to stdout)
-    local restarts
-    restarts=$(echo "$content" | grep -c -E "trying to restart|pkill -9 mysql" 2>/dev/null)
-    restarts=$(echo "$restarts" | tr -d '[:space:]')
-    restarts=$(( ${restarts:-0} + 0 ))
+    # Count lines
+    if [[ "$logfile" == *.gz ]]; then
+        lines=$(zcat "$logfile" 2>/dev/null | wc -l)
+        # Count restarts — grep directly, toint strips any whitespace/newlines
+        restarts=$(zcat "$logfile" 2>/dev/null | grep -cE "trying to restart|pkill -9 mysql" 2>/dev/null)
+        first_crash=$(zcat "$logfile" 2>/dev/null | grep -E "'mysql'.*(zombie|not running|failed)" | head -1)
+    else
+        lines=$(wc -l < "$logfile" 2>/dev/null)
+        restarts=$(grep -cE "trying to restart|pkill -9 mysql" "$logfile" 2>/dev/null)
+        first_crash=$(grep -E "'mysql'.*(zombie|not running|failed)" "$logfile" 2>/dev/null | head -1)
+    fi
 
-    local first_crash first_crash_time
-    first_crash=$(echo "$content" | grep -E "'mysql'.*(zombie|not running|failed)" | head -1)
-    first_crash_time=$(echo "$first_crash" | grep -oP '\[\K[^\]]+' | head -1)
+    # Sanitize to integers — this is the key fix
+    restarts=$(toint "$restarts")
+    lines=$(toint "$lines")
 
     TOTAL_RESTARTS=$(( TOTAL_RESTARTS + restarts ))
 
+    first_crash_time=$(echo "$first_crash" | grep -oP '\[\K[^\]]+' | head -1)
     if [ -n "$first_crash_time" ] && [ -z "$FIRST_CRASH_DATE" ]; then
         FIRST_CRASH_DATE="$first_crash_time"
         FIRST_CRASH_LOG="$label"
         FIRST_CRASH_MSG=$(echo "$first_crash" | sed "s/\[.*\] [a-z]* *: //")
     fi
 
-    local lines
-    lines=$(echo "$content" | wc -l | tr -d '[:space:]')
     echo -e "  ${BOLD}$label${NC}: ${restarts} restarts | ${lines} total lines"
     if [ -n "$first_crash_time" ]; then
         echo -e "    First crash : $first_crash_time"
@@ -189,23 +185,22 @@ else
 fi
 echo ""
 
-# Crash loop detection from current log
-CL_COUNT=$(grep -c -E "pkill -9 mysql|trying to restart" /var/log/monit.log 2>/dev/null)
-CL_COUNT=$(echo "$CL_COUNT" | tr -d '[:space:]')
-CL_COUNT=$(( ${CL_COUNT:-0} + 0 ))
+# Crash loop detection — grep directly on file, toint for safety
+CL_COUNT=$(grep -cE "pkill -9 mysql|trying to restart" /var/log/monit.log 2>/dev/null)
+CL_COUNT=$(toint "$CL_COUNT")
 
 if [ "$CL_COUNT" -gt 10 ]; then
     LOOP_START=$(grep -E "pkill -9 mysql|trying to restart" /var/log/monit.log 2>/dev/null | head -1 | grep -oP '\[\K[^\]]+')
     LOOP_END=$(  grep -E "pkill -9 mysql|trying to restart" /var/log/monit.log 2>/dev/null | tail -1 | grep -oP '\[\K[^\]]+')
     START_TS=$(date -d "$LOOP_START" +%s 2>/dev/null || echo 0)
     END_TS=$(  date -d "$LOOP_END"   +%s 2>/dev/null || echo 0)
+    START_TS=$(toint "$START_TS"); END_TS=$(toint "$END_TS")
     if [ "$START_TS" -gt 0 ] && [ "$END_TS" -gt "$START_TS" ]; then
         DURATION=$(( END_TS - START_TS ))
         HOURS=$(( DURATION / 3600 ))
         MINS=$((  (DURATION % 3600) / 60 ))
         SECS_PER=$(( DURATION / CL_COUNT ))
-        if [ "$SECS_PER" -ge 60 ]; then RATE="$(( SECS_PER/60 )) min"
-        else RATE="${SECS_PER} sec"; fi
+        [ "$SECS_PER" -ge 60 ] && RATE="$(( SECS_PER/60 )) min" || RATE="${SECS_PER} sec"
         echo -e "  ${RED}${BOLD}WARNING: CRASH LOOP DETECTED${NC}"
         echo -e "  Loop Start : $LOOP_START"
         echo -e "  Loop End   : $LOOP_END"
@@ -227,7 +222,7 @@ LAST_MYSQL_PATCH=$(
         [ -f "$f" ] || continue
         if [[ "$f" == *.gz ]]; then L=$(zcat "$f" 2>/dev/null | grep -iE " (upgrade|install) .*(mysql|mariadb)" | tail -1)
         else L=$(grep -iE " (upgrade|install) .*(mysql|mariadb)" "$f" 2>/dev/null | tail -1); fi
-        [ -n "$L" ] && { echo "$L" | awk '{print $1, $2}'; break; }
+        [ -n "$L" ] && { echo "$L" | awk '{print $1,$2}'; break; }
     done
 )
 echo -e "  OS               : $PRETTY_NAME"
@@ -237,8 +232,8 @@ echo -e "  Last System Patch: $(grep -E ' upgrade | install ' /var/log/dpkg.log 
 echo -e "  Last MySQL Patch : ${LAST_MYSQL_PATCH:-Not found in dpkg logs}"
 echo -e "  First Crash      : ${FIRST_CRASH_DATE:-None found} (${FIRST_CRASH_LOG:-N/A})"
 echo -e "  Total Restarts   : ${BOLD}${RED}${TOTAL_RESTARTS}${NC}"
-[ "$SWAP_TOTAL" -gt 0 ] && \
-    echo -e "  Swap Used        : ${SWAP_PCT}% ($(( (SWAP_TOTAL-SWAP_FREE)/1024 ))MB / $(( SWAP_TOTAL/1024 ))MB)" || \
-    echo -e "  Swap Used        : N/A"
+[ "$SWAP_TOTAL" -gt 0 ] \
+  && echo -e "  Swap Used        : ${SWAP_PCT}% ($(( (SWAP_TOTAL-SWAP_FREE)/1024 ))MB / $(( SWAP_TOTAL/1024 ))MB)" \
+  || echo -e "  Swap Used        : N/A"
 echo -e "${BOLD}========================================================${NC}"
 echo ""
