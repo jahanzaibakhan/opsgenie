@@ -10,51 +10,17 @@ if [ -n "$1" ]; then
     LOCAL_IPS=$(hostname -I 2>/dev/null)
     if ! echo "$LOCAL_IPS" | grep -qw "$1"; then
 
-        # 1. Find cng script (Cloudways jump-server helper)
-        CNG_PATH=""
-        for p in "/home/${USER}/cng" "/home/master/cng" "/usr/local/bin/cng" "$(which cng 2>/dev/null)"; do
-            [ -f "$p" ] && CNG_PATH="$p" && break
-        done
+        # Cloudways jump-server credentials (matches cng script)
+        CW_KEY="/home/${USER}/platformops"
+        CW_USER="systeam"
+        SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
 
-        # 2. Parse SSH key + user from cng (it's a shell script wrapper around ssh)
-        SSH_KEY="" ; SSH_USER="" ; SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
-        if [ -n "$CNG_PATH" ] && file "$CNG_PATH" 2>/dev/null | grep -qi "text"; then
-            SSH_KEY=$(grep -oE '\-i [^ ]+' "$CNG_PATH" 2>/dev/null | awk '{print $2}' | head -1)
-            SSH_USER=$(grep -oE '[A-Za-z0-9_]+@' "$CNG_PATH" 2>/dev/null | tr -d '@' | grep -v '^$' | tail -1)
-            SSH_PORT=$(grep -oE '\-p [0-9]+' "$CNG_PATH" 2>/dev/null | awk '{print $2}' | head -1)
-            [ -n "$SSH_PORT" ] && SSH_OPTS="$SSH_OPTS -p $SSH_PORT"
-        fi
+        REMOTE_CMD="curl -s '${SCRIPT_URL}' | sudo bash -s '${1}'"
 
-        # 3. Build SSH command — fall back through likely Cloudways users/keys
-        SSH_USER="${SSH_USER:-systeam}"
-        SSH_KEY_OPT=""
-        if [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
-            SSH_KEY_OPT="-i $SSH_KEY"
-        else
-            for k in ~/.ssh/id_rsa ~/.ssh/id_ed25519 /home/master/.ssh/id_rsa; do
-                [ -f "$k" ] && SSH_KEY_OPT="-i $k" && break
-            done
-        fi
-
-        REMOTE_CMD="curl -s '${SCRIPT_URL}' | bash -s '${1}'"
-
-        echo "Connecting to ${1} as ${SSH_USER}..."
+        echo "Connecting to ${1}..."
         # shellcheck disable=SC2086
-        ssh $SSH_KEY_OPT $SSH_OPTS "${SSH_USER}@${1}" "$REMOTE_CMD"
-        SSH_EXIT=$?
-
-        # 4. If first user fails, retry with other common users
-        if [ $SSH_EXIT -ne 0 ]; then
-            for TRY_USER in master root; do
-                [ "$TRY_USER" = "$SSH_USER" ] && continue
-                echo "Retrying as ${TRY_USER}..."
-                # shellcheck disable=SC2086
-                ssh $SSH_KEY_OPT $SSH_OPTS "${TRY_USER}@${1}" "$REMOTE_CMD" && break
-                SSH_EXIT=$?
-            done
-        fi
-
-        exit $SSH_EXIT
+        ssh -i "$CW_KEY" $SSH_OPTS "${CW_USER}@${1}" "$REMOTE_CMD"
+        exit $?
     fi
 fi
 
