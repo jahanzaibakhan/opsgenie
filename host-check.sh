@@ -1,31 +1,11 @@
 #!/bin/bash
 # host-check.sh - Quick server health check
-# Usage: curl -s https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/host-check.sh | bash -s <SERVER_IP>
+# Usage (run ON the target server):
+#   curl -s https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/host-check.sh | bash -s <SERVER_IP>
 
-SCRIPT_URL="https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/host-check.sh"
 SERVER_IP="${1:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
-
-# ── Remote execution (jump server → target) ────────────────────────────────
-if [ -n "$1" ]; then
-    LOCAL_IPS=$(hostname -I 2>/dev/null)
-    if ! echo "$LOCAL_IPS" | grep -qw "$1"; then
-
-        # Cloudways jump-server credentials (matches cng script)
-        CW_KEY="/home/${USER}/platformops"
-        CW_USER="systeam"
-        SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
-
-        REMOTE_CMD="curl -s '${SCRIPT_URL}' | sudo bash -s '${1}'"
-
-        echo "Connecting to ${1}..."
-        # shellcheck disable=SC2086
-        ssh -i "$CW_KEY" $SSH_OPTS "${CW_USER}@${1}" "$REMOTE_CMD"
-        exit $?
-    fi
-fi
-
-# ── Local checks (runs ON the target server) ──────────────────────────────
 DIVIDER="============================================================"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -56,7 +36,7 @@ check_service() {
         done
     fi
 
-    local label="${name}"
+    local label="$name"
     [ -n "$found_unit" ] && label="${name} (${found_unit})"
 
     case "$status" in
