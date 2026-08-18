@@ -378,48 +378,164 @@ if screen_exists; then
     fi
 fi
 
-# Build non-interactive runner for the detached session
+# Build non-interactive runner for the detached session (colors + backup.fact details)
 {
-    echo "#!/bin/bash"
-    echo "set -u"
-    echo "BACKUP_SCRIPT=$(printf '%q' "$BACKUP_SCRIPT")"
-    echo "echo \"==================================================\""
-    echo "echo \"Backup runner started \$(date '+%Y-%m-%d %H:%M:%S')\""
-    echo "echo \"Screen: ${SCREEN_NAME}\""
-    echo "echo \"==================================================\""
+    printf '%s\n' '#!/bin/bash' 'set -u' 'export TERM="${TERM:-xterm-256color}"'
+    printf 'BACKUP_SCRIPT=%q\n' "$BACKUP_SCRIPT"
+    printf 'FACTS_FILE=%q\n' "$FACTS_FILE"
+    printf 'SCREEN_NAME=%q\n' "$SCREEN_NAME"
     if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
-        printf "APPS=("
+        printf 'APPS=('
         for APP in "${ELIGIBLE_APPS[@]}"; do
-            printf " %q" "$APP"
+            printf ' %q' "$APP"
         done
-        echo " )"
-        echo "FAIL=0"
-        echo "for APP in \"\${APPS[@]}\"; do"
-        echo "  echo"
-        echo "  echo \"▶ Backup \$APP ...\""
-        echo "  if sudo \"\$BACKUP_SCRIPT\" -a \"\$APP\"; then"
-        echo "    echo \"✔ Backup finished for \$APP\""
-        echo "  else"
-        echo "    echo \"✖ Backup failed for \$APP (exit \$?)\""
-        echo "    FAIL=1"
-        echo "  fi"
-        echo "done"
+        printf ' )\n'
+        echo 'FULL_BACKUP=0'
     else
-        echo "echo \"▶ No failed apps with data — running full server backup\""
-        echo "FAIL=0"
-        echo "if sudo \"\$BACKUP_SCRIPT\"; then"
-        echo "  echo \"✔ Full backup finished\""
-        echo "else"
-        echo "  echo \"✖ Full backup failed (exit \$?)\""
-        echo "  FAIL=1"
-        echo "fi"
+        echo 'APPS=()'
+        echo 'FULL_BACKUP=1'
     fi
-    echo "echo"
-    echo "echo \"==================================================\""
-    echo "echo \"Runner finished \$(date '+%Y-%m-%d %H:%M:%S')  fail=\$FAIL\""
-    echo "echo \"==================================================\""
-    echo "echo \"This window stays open. Detach: Ctrl+A then D\""
-    echo "exec bash"
+    cat << 'RUNNER_BODY'
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+fact_val() {
+    local key="$1"
+    local line val
+    [[ -f "$FACTS_FILE" ]] || { echo ""; return; }
+    line=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$FACTS_FILE" 2>/dev/null | tail -n 1)
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    echo "$val"
+}
+
+print_fact_block() {
+    local app="$1"
+    [[ -f "$FACTS_FILE" ]] || { echo "  facts file missing: $FACTS_FILE"; return; }
+    grep -E "^[[:space:]]*(error_code|last_backup|backup_|status_|next_backup).*${app}" "$FACTS_FILE" 2>/dev/null \
+        || grep -F "$app" "$FACTS_FILE" 2>/dev/null \
+        || echo "  no matching lines for $app in $FACTS_FILE"
+}
+
+print_app_report() {
+    local app="$1" rc="$2"
+    local err last color label
+    err=$(fact_val "error_code_${app}")
+    last=$(fact_val "last_backup_${app}")
+    [[ -z "$err" ]] && err="n/a"
+    [[ -z "$last" ]] && last="n/a"
+
+    if [[ "$rc" -eq 0 && "$err" == "0" ]]; then
+        color="$GREEN"; label="COMPLETED"
+    elif [[ "$rc" -eq 0 && "$err" != "0" && "$err" != "n/a" ]]; then
+        color="$YELLOW"; label="FINISHED WITH FACT ERROR"
+    elif [[ "$rc" -eq 0 ]]; then
+        color="$GREEN"; label="COMPLETED"
+    else
+        color="$RED"; label="FAILED"
+    fi
+
+    echo -e "${color}${BOLD}--------------------------------------------------${NC}"
+    echo -e "${color}${BOLD}${label}${NC}  ${BOLD}app:${NC} ${color}${app}${NC}"
+    echo -e "  ${BOLD}script exit:${NC} $rc"
+    echo -e "  ${BOLD}error_code_${app}:${NC} ${color}${err}${NC}"
+    echo -e "  ${BOLD}last_backup_${app}:${NC} ${color}${last}${NC}"
+    echo -e "  ${BOLD}from:${NC} $FACTS_FILE"
+    echo -e "  ${BOLD}fact lines:${NC}"
+    print_fact_block "$app" | sed 's/^/    /'
+    echo -e "${color}${BOLD}--------------------------------------------------${NC}"
+}
+
+echo -e "${BOLD}==================================================${NC}"
+echo -e "${BOLD} Backup runner started $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+echo -e "${BOLD} Screen: ${SCREEN_NAME}${NC}"
+echo -e "${BOLD}==================================================${NC}"
+
+FAIL=0
+declare -a RESULT_APPS RESULT_RC
+
+if [[ "$FULL_BACKUP" -eq 1 ]]; then
+    echo -e "${YELLOW}No failed apps with data — running full server backup${NC}"
+    if sudo "$BACKUP_SCRIPT"; then
+        rc=0
+    else
+        rc=$?
+        FAIL=1
+    fi
+    if [[ -f "$FACTS_FILE" ]]; then
+        mapfile -t APPS < <(grep -E '^[[:space:]]*error_code_' "$FACTS_FILE" | sed -E 's/^[[:space:]]*error_code_//;s/[[:space:]]*=.*//' )
+    fi
+    if [[ ${#APPS[@]} -eq 0 ]]; then
+        RESULT_APPS+=("ALL"); RESULT_RC+=("$rc")
+        if [[ "$rc" -eq 0 ]]; then
+            echo -e "${GREEN}${BOLD}FULL BACKUP COMPLETED${NC}"
+        else
+            echo -e "${RED}${BOLD}FULL BACKUP FAILED${NC} (exit $rc)"
+        fi
+        [[ -f "$FACTS_FILE" ]] && cat "$FACTS_FILE"
+    else
+        for APP in "${APPS[@]}"; do
+            err=$(fact_val "error_code_${APP}")
+            app_rc=0
+            [[ "$err" =~ ^[0-9]+$ && "$err" -ne 0 ]] && app_rc=1
+            [[ "$rc" -ne 0 ]] && app_rc=1
+            RESULT_APPS+=("$APP"); RESULT_RC+=("$app_rc")
+            print_app_report "$APP" "$app_rc"
+            [[ "$app_rc" -ne 0 ]] && FAIL=1
+        done
+    fi
+else
+    for APP in "${APPS[@]}"; do
+        echo
+        echo -e "${CYAN}${BOLD}▶ Backup ${APP} ...${NC}"
+        if sudo "$BACKUP_SCRIPT" -a "$APP"; then
+            rc=0
+        else
+            rc=$?
+            FAIL=1
+        fi
+        RESULT_APPS+=("$APP"); RESULT_RC+=("$rc")
+        print_app_report "$APP" "$rc"
+    done
+fi
+
+echo
+echo -e "${BOLD}==================================================${NC}"
+echo -e "${BOLD} Backup result (from ${FACTS_FILE})${NC}"
+echo -e "${BOLD}==================================================${NC}"
+printf "${BOLD}%-8s %-22s %-14s %-s${NC}\n" "STATUS" "APP" "ERROR_CODE" "LAST BACKUP (date time)"
+printf "%-8s %-22s %-14s %-s\n" "------" "---" "----------" "----------------------"
+for i in "${!RESULT_APPS[@]}"; do
+    APP="${RESULT_APPS[$i]}"
+    rc="${RESULT_RC[$i]}"
+    err=$(fact_val "error_code_${APP}")
+    last=$(fact_val "last_backup_${APP}")
+    [[ -z "$err" ]] && err="n/a"
+    [[ -z "$last" ]] && last="n/a"
+    if [[ "$rc" -eq 0 && ( "$err" == "0" || "$err" == "n/a" ) ]]; then
+        echo -e "${GREEN}${BOLD}OK      ${NC}${GREEN}${APP}${NC}  error_code=${GREEN}${err}${NC}  last_backup=${GREEN}${last}${NC}"
+    else
+        echo -e "${RED}${BOLD}FAILED  ${NC}${RED}${APP}${NC}  error_code=${RED}${err}${NC}  last_backup=${RED}${last}${NC}  exit=${rc}"
+        FAIL=1
+    fi
+done
+
+echo
+if [[ "$FAIL" -eq 0 ]]; then
+    echo -e "${GREEN}${BOLD}All backups completed successfully${NC}"
+else
+    echo -e "${RED}${BOLD}One or more backups failed — see red lines above${NC}"
+fi
+echo -e "${BOLD}Runner finished $(date '+%Y-%m-%d %H:%M:%S')  fail=${FAIL}${NC}"
+echo -e "${BOLD}==================================================${NC}"
+echo "This window stays open. Detach: Ctrl+A then D"
+exec bash
+RUNNER_BODY
 } > "$RUNNER"
 chmod 700 "$RUNNER"
 
