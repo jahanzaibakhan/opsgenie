@@ -11,6 +11,7 @@ readonly APP_ROOT="/home/master/applications"
 readonly LOG_LIMIT_BYTES=$((100 * 1024 * 1024))
 declare -a CLEANED_ITEMS=()
 declare -a FAILED_ITEMS=()
+declare -i EXPECTED_RECLAIMED_BYTES=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     readonly C_RESET=$'\033[0m'
@@ -63,6 +64,10 @@ directory_size_bytes() {
     sudo du -sxB1 "$1" 2>/dev/null | awk '{print $1}'
 }
 
+allocated_file_bytes() {
+    sudo du -sB1 -- "$1" 2>/dev/null | awk '{print $1}'
+}
+
 show_disk_usage() {
     df -hT 2>/dev/null || df -h
 }
@@ -84,6 +89,57 @@ show_reclaimed_space() {
         warning "• Free space on / decreased by $(human_size "$((before - after))") while the script ran."
     fi
     success "✓ Free space available on /: $(human_size "$after")"
+}
+
+show_deleted_open_files() {
+    local total=0
+    local threshold=$((10 * 1024 * 1024))
+    local output
+
+    section "Deleted files still held open"
+    if ! command -v lsof >/dev/null 2>&1; then
+        warning "• lsof is unavailable; cannot check for deleted files still held open."
+        return
+    fi
+
+    output=$(sudo lsof -nP +L1 2>/dev/null |
+        awk -v threshold="$threshold" '
+            NR > 1 && $7 ~ /^[0-9]+$/ && $7 >= threshold {
+                total += $7
+                print $7 "\t" $1 "\t" $2 "\t" $9
+            }
+            END { if (total > 0) print "TOTAL\t" total }
+        ')
+
+    if [[ -z "$output" ]]; then
+        success "✓ No deleted-but-open files of 10 MiB or larger were found."
+        return
+    fi
+
+    warning "• These deleted files still consume disk space until their owning process closes or restarts:"
+    while IFS=$'\t' read -r size command pid file; do
+        if [[ "$size" == "TOTAL" ]]; then
+            warning "• Space still held by the listed files: $(human_size "$command")"
+        else
+            printf '%-14s %-20s PID %-8s %s\n' "$(human_size "$size")" "$command" "$pid" "$file"
+        fi
+    done <<< "$output"
+}
+
+show_cleanup_reconciliation() {
+    local before="$1"
+    local after="$2"
+    local observed=$((after - before))
+
+    section "Cleanup space reconciliation"
+    echo "Allocated blocks cleared: $(human_size "$EXPECTED_RECLAIMED_BYTES")"
+    echo "Observed free-space increase: $(human_size "$(( observed > 0 ? observed : 0 ))")"
+
+    if (( observed + (16 * 1024 * 1024) < EXPECTED_RECLAIMED_BYTES )); then
+        warning "• The free-space increase is lower than the allocated blocks cleared."
+        warning "• A process may still hold deleted files open, or active writes may have consumed space during cleanup."
+        show_deleted_open_files
+    fi
 }
 
 show_top_directories() {
@@ -148,6 +204,7 @@ clean_duplicity_cache() {
     local bytes
     bytes=$(directory_size_bytes "$DUPLICITY_CACHE" || echo 0)
     if sudo find "$DUPLICITY_CACHE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; then
+        EXPECTED_RECLAIMED_BYTES+=bytes
         CLEANED_ITEMS+=("$DUPLICITY_CACHE contents ($(human_size "$bytes") removed)")
         success "✓ Cleared cache contents from $DUPLICITY_CACHE ($(human_size "$bytes"))."
     else
@@ -158,17 +215,19 @@ clean_duplicity_cache() {
 
 truncate_large_logs() {
     section "Log files larger than 100 MiB"
-    local file bytes
+    local file apparent_bytes bytes
     local count=0
 
     # Search the current filesystem only. This avoids traversing mounted backups,
     # network shares, /proc, /sys, and other virtual filesystems.
     while IFS= read -r -d '' file; do
         is_log_file "$file" || continue
-        bytes=$(sudo stat -c '%s' -- "$file" 2>/dev/null || echo 0)
-        (( bytes > LOG_LIMIT_BYTES )) || continue
+        apparent_bytes=$(sudo stat -c '%s' -- "$file" 2>/dev/null || echo 0)
+        (( apparent_bytes > LOG_LIMIT_BYTES )) || continue
+        bytes=$(allocated_file_bytes "$file" || echo 0)
 
         if sudo truncate -s 0 -- "$file"; then
+            EXPECTED_RECLAIMED_BYTES+=bytes
             CLEANED_ITEMS+=("$file ($(human_size "$bytes") truncated)")
             success "✓ Truncated: $file ($(human_size "$bytes"))"
             ((count++))
@@ -220,6 +279,7 @@ main() {
     show_disk_usage
     free_after=$(free_space_bytes || echo 0)
     show_reclaimed_space "$free_before" "$free_after"
+    show_cleanup_reconciliation "$free_before" "$free_after"
     show_top_directories "Top 5 largest root-level directories after cleanup"
     show_top_applications "Top 5 largest application directories after cleanup"
 
