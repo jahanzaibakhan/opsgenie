@@ -7,6 +7,7 @@ set -u
 set -o pipefail
 
 readonly DUPLICITY_CACHE="/home/.duplicity"
+readonly APP_ROOT="/home/master/applications"
 readonly LOG_LIMIT_BYTES=$((100 * 1024 * 1024))
 declare -a CLEANED_ITEMS=()
 declare -a FAILED_ITEMS=()
@@ -50,6 +51,28 @@ show_top_directories() {
         done
 }
 
+show_top_applications() {
+    local title="$1"
+    local app_dir bytes
+
+    section "$title"
+    if [[ ! -d "$APP_ROOT" ]]; then
+        echo "Application directory not found: $APP_ROOT"
+        return
+    fi
+
+    printf '%-14s %s\n' "SIZE" "APPLICATION"
+    while IFS=$'\t' read -r bytes app_dir; do
+        printf '%-14s %s\n' "$(human_size "$bytes")" "$app_dir"
+    done < <(
+        for app_dir in "$APP_ROOT"/*; do
+            [[ -d "$app_dir" ]] || continue
+            bytes=$(directory_size_bytes "$app_dir" || echo 0)
+            printf '%s\t%s\n' "$bytes" "$(basename "$app_dir")"
+        done | sort -rn | head -n 5
+    )
+}
+
 is_log_file() {
     local path="$1"
     case "$path" in
@@ -68,15 +91,20 @@ clean_duplicity_cache() {
         echo "No cache found at $DUPLICITY_CACHE."
         return
     fi
+    if [[ ! -d "$DUPLICITY_CACHE" ]]; then
+        FAILED_ITEMS+=("$DUPLICITY_CACHE (not a directory)")
+        echo "ERROR: $DUPLICITY_CACHE exists but is not a directory." >&2
+        return
+    fi
 
     local bytes
     bytes=$(directory_size_bytes "$DUPLICITY_CACHE" || echo 0)
-    if sudo rm -rf -- "$DUPLICITY_CACHE"; then
-        CLEANED_ITEMS+=("$DUPLICITY_CACHE ($(human_size "$bytes") removed)")
-        echo "Removed $DUPLICITY_CACHE ($(human_size "$bytes"))."
+    if sudo find "$DUPLICITY_CACHE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; then
+        CLEANED_ITEMS+=("$DUPLICITY_CACHE contents ($(human_size "$bytes") removed)")
+        echo "Removed cache contents from $DUPLICITY_CACHE ($(human_size "$bytes"))."
     else
         FAILED_ITEMS+=("$DUPLICITY_CACHE")
-        echo "ERROR: Could not remove $DUPLICITY_CACHE." >&2
+        echo "ERROR: Could not clear contents of $DUPLICITY_CACHE." >&2
     fi
 }
 
@@ -112,7 +140,7 @@ main() {
     fi
 
     section "Disk cleanup started: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    echo "This script removes only $DUPLICITY_CACHE and truncates log files over 100 MiB."
+    echo "This script clears only the contents of $DUPLICITY_CACHE and truncates log files over 100 MiB."
     echo "It does not remove any of the reported top directories."
     echo
     echo "Sudo access is required; you may be prompted for your password."
@@ -121,6 +149,7 @@ main() {
     section "Disk usage before cleanup"
     show_disk_usage
     show_top_directories "Top 5 largest root-level directories before cleanup"
+    show_top_applications "Top 5 largest application directories before cleanup"
 
     clean_duplicity_cache
     truncate_large_logs
@@ -140,6 +169,7 @@ main() {
     section "Disk usage after cleanup"
     show_disk_usage
     show_top_directories "Top 5 largest root-level directories after cleanup"
+    show_top_applications "Top 5 largest application directories after cleanup"
 
     section "Disk cleanup completed"
 }
