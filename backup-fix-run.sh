@@ -102,8 +102,17 @@ setup_script_log() {
         exit 1
     fi
 
-    exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
+    printf 'Backup diagnose + run started: %s\nLog path: %s\n\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$SCRIPT_LOG_FILE" >> "$SCRIPT_LOG_FILE"
     echo -e "${CYAN}Script output log: ${SCRIPT_LOG_FILE}${NC}"
+}
+
+log_section() {
+    printf '\n==================================================\n%s\n==================================================\n' "$1" >> "$SCRIPT_LOG_FILE"
+}
+
+log_line() {
+    printf '%s\n' "$1" >> "$SCRIPT_LOG_FILE"
 }
 
 trim() {
@@ -141,11 +150,15 @@ capacity_check_app() {
     local failed=0
 
     [[ "$required" -gt 0 ]] || return 0
+    log_section "Capacity check: ${app}"
+    log_line "Database size: $(to_readable "$(( required * 100 / SPACE_MULTIPLIER_PERCENT ))")"
+    log_line "Required free space: $(to_readable "$required")"
     for label in "Database:/var/lib/mysql/$app" "Application:$APPS_PATH/$app" "Temporary:$BACKUP_TEMP_DIR" "Duplicity cache:$DUPLICITY_CACHE"; do
         path="${label#*:}"
         info=$(mount_info "$path")
         if [[ -z "$info" ]]; then
             echo -e "${RED}  ${label}: unable to determine filesystem capacity${NC}"
+            log_line "FAIL ${label}: unable to determine filesystem capacity"
             DISK_PRESSURE_DETAILS+=("${app} ${label}: filesystem capacity could not be determined")
             failed=1
             continue
@@ -155,8 +168,10 @@ capacity_check_app() {
         seen_mounts["$filesystem:$mount"]=1
         if (( available >= required )); then
             echo -e "${GREEN}  PASS ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+            log_line "PASS ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")"
         else
             echo -e "${RED}  FAIL ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+            log_line "FAIL ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")"
             DISK_PRESSURE_DETAILS+=("${app} ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")")
             failed=1
         fi
@@ -295,6 +310,8 @@ ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -n 6
 echo
 echo -e "${BOLD}▶ Step 3: ${FACTS_FILE}${NC}"
 if [[ -f "$FACTS_FILE" ]]; then
+    log_section "backup.fact contents (${FACTS_FILE})"
+    cat "$FACTS_FILE" >> "$SCRIPT_LOG_FILE"
     while IFS= read -r line || [[ -n "$line" ]]; do
         if echo "$line" | grep -qi "error"; then
             echo -e "${RED}${line}${NC}"
@@ -399,6 +416,8 @@ fi
 echo
 echo -e "${BOLD}▶ Step 5: Disk usage${NC}"
 df -h
+log_section "Disk usage (df -h)"
+df -h >> "$SCRIPT_LOG_FILE"
 while read -r FS SIZE USED AVAIL USEP MOUNT; do
     [[ "${USEP:-}" == *%* ]] || continue
     USE=${USEP%\%}
@@ -419,6 +438,8 @@ if [[ ${#ERROR_APPS[@]} -eq 0 ]]; then
 else
     printf "${BOLD}%-22s %-8s %-21s %-25s %-12s %-12s %-12s${NC}\n" "App" "Error" "Last backup (UTC)" "Status" "Files" "DB" "Total"
     printf "%-22s %-8s %-21s %-25s %-12s %-12s %-12s\n" "---" "-----" "-----------------" "------" "-----" "--" "-----"
+    log_section "Failed/removed app status, sizes, and eligibility"
+    log_line "App | Error | Last backup (UTC) | Status | Files | DB | Total"
     while IFS= read -r APP; do
         FILE_SIZE="N/A"
         FILE_BYTES=0
@@ -445,13 +466,17 @@ else
         fi
         printf "%-22s %-8s %-21s ${STATUS_COLOR}%-25s${NC} %-12s %-12s %-12s\n" \
             "$APP" "$ERROR_CODE" "$LAST_BACKUP" "$STATUS" "$FILE_SIZE" "$DB_SIZE" "$(to_readable "$TOTAL_BYTES")"
+        log_line "${APP} | ${ERROR_CODE} | ${LAST_BACKUP} | ${STATUS} | ${FILE_SIZE} | ${DB_SIZE} | $(to_readable "$TOTAL_BYTES")"
         if [[ "$STATUS" == "FAILED"* && "$TOTAL_BYTES" -gt 0 ]]; then
             ELIGIBLE_APPS+=("$APP")
+            log_line "Eligibility: queued for failed-app backup"
         else
             if [[ "$STATUS" == "REMOVED"* ]]; then
                 echo -e "${RED}  removed ${APP}: application and database paths are both missing; backup skipped.${NC}"
+                log_line "Eligibility: removed; backup skipped"
             else
                 echo -e "${YELLOW}  not queued ${APP}: ${STATUS}${NC}"
+                log_line "Eligibility: not queued"
             fi
         fi
     done < <(printf '%s\n' "${ERROR_APPS[@]}" | sort)
@@ -551,30 +576,40 @@ echo
 echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD} Diagnosis summary${NC}"
 echo -e "${BOLD}==================================================${NC}"
+log_section "Diagnosis summary"
 for r in "${REMARKS[@]}"; do
     echo " - $r"
+    log_line " - $r"
 done
 if [[ "$DISK_ERROR_FOUND" == true ]]; then
     echo -e "${RED} - Disk capacity warnings:${NC}"
+    log_line " - Disk capacity warnings:"
     for detail in "${DISK_PRESSURE_DETAILS[@]}"; do
         echo -e "${RED}   - ${detail}${NC}"
+        log_line "   - ${detail}"
     done
 fi
 if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW} - Failed apps queued first: ${ELIGIBLE_APPS[*]}${NC}"
+    log_line " - Failed apps queued first: ${ELIGIBLE_APPS[*]}"
 fi
 if [[ ${#OVERDUE_APPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW} - Overdue apps queued after failed-app backups: ${OVERDUE_APPS[*]}${NC}"
+    log_line " - Overdue apps queued after failed-app backups: ${OVERDUE_APPS[*]}"
 fi
 if [[ ${#REMOVED_APPS[@]} -gt 0 ]]; then
     echo -e "${RED} - Removed apps skipped: ${REMOVED_APPS[*]}${NC}"
+    log_line " - Removed apps skipped: ${REMOVED_APPS[*]}"
 fi
 if [[ ${#SPACE_SKIPPED_APPS[@]} -gt 0 ]]; then
     echo -e "${RED} - Apps not queued due to insufficient required-mount space: ${SPACE_SKIPPED_APPS[*]}${NC}"
+    log_line " - Apps not queued due to insufficient required-mount space: ${SPACE_SKIPPED_APPS[*]}"
 elif [[ ${#ERROR_APPS[@]} -gt 0 && ${#ELIGIBLE_APPS[@]} -eq 0 ]]; then
     echo -e "${YELLOW} - Failed apps listed but all have zero size${NC}"
+    log_line " - Failed apps listed but all have zero size"
 elif [[ ${#ERROR_APPS[@]} -eq 0 && ${#OVERDUE_APPS[@]} -eq 0 ]]; then
     echo -e "${GREEN} - No failed or overdue apps found in facts file${NC}"
+    log_line " - No failed or overdue apps found in facts file"
 fi
 echo
 
@@ -807,6 +842,11 @@ else
                 FAIL=1
                 continue
             fi
+            FILE_SIZE=$(sudo du -sh "$APPS_PATH/$APP" 2>/dev/null | awk '{print $1}')
+            DB_SIZE=$(sudo du -sh "/var/lib/mysql/$APP" 2>/dev/null | awk '{print $1}')
+            [[ -n "$FILE_SIZE" ]] || FILE_SIZE="n/a"
+            [[ -n "$DB_SIZE" ]] || DB_SIZE="0B"
+            echo -e "${CYAN}Overdue status: ${APP} | Files: ${FILE_SIZE} | DB: ${DB_SIZE} | Eligibility: checking capacity${NC}"
             echo -e "${CYAN}${BOLD}▶ Overdue-app backup ${APP} ...${NC}"
             if ! capacity_check_app "$APP"; then
                 echo -e "${RED}${BOLD}SKIPPED: ${APP} no longer has sufficient free space for a safe backup.${NC}"
