@@ -30,9 +30,6 @@ SCREEN_NAME="back"
 RUNNER="/tmp/opsgenie-backup-runner.sh"
 SCRIPT_LOG_DIR="/var/cw/systeam/backup-log"
 SCRIPT_LOG_FILE=""
-GITHUB_TRACK_OWNER="jahanzaibakhan"
-GITHUB_TRACK_REPO="opsgenie"
-GITHUB_TRACK_ISSUE="2"
 CPU_THRESHOLD=70
 SWAP_THRESHOLD=50
 SPACE_MULTIPLIER_PERCENT=120
@@ -105,31 +102,6 @@ setup_script_log() {
 
     exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
     echo -e "${CYAN}Script output log: ${SCRIPT_LOG_FILE}${NC}"
-}
-
-github_report() {
-    local event="$1"
-    local details="$2"
-    local host payload body escaped
-
-    [[ -n "${GITHUB_TOKEN:-}" ]] || return 0
-    have_cmd curl || { echo -e "${YELLOW}GitHub usage tracking skipped: curl is unavailable.${NC}"; return 0; }
-
-    host=$(hostname -f 2>/dev/null || hostname)
-    body="[backup-fix-run] ${event} | server=${host} | utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC') | ${details}"
-    escaped=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    payload="{\"body\":\"${escaped}\"}"
-
-    if curl -fsS -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "https://api.github.com/repos/${GITHUB_TRACK_OWNER}/${GITHUB_TRACK_REPO}/issues/${GITHUB_TRACK_ISSUE}/comments" \
-        --data "$payload" >/dev/null; then
-        echo -e "${GREEN}Usage recorded in GitHub issue #${GITHUB_TRACK_ISSUE}.${NC}"
-    else
-        echo -e "${YELLOW}GitHub usage tracking failed; backup processing continues.${NC}"
-    fi
 }
 
 trim() {
@@ -248,7 +220,6 @@ screen_exists() {
 }
 
 setup_script_log
-github_report "STARTED" "log=${SCRIPT_LOG_FILE}"
 
 echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD} Backup diagnose + run (screen: ${SCREEN_NAME})${NC}"
@@ -599,9 +570,6 @@ fi
     printf 'BACKUP_TEMP_DIR=%q\n' "$BACKUP_TEMP_DIR"
     printf 'SPACE_MULTIPLIER_PERCENT=%q\n' "$SPACE_MULTIPLIER_PERCENT"
     printf 'SCRIPT_LOG_FILE=%q\n' "$SCRIPT_LOG_FILE"
-    printf 'GITHUB_TRACK_OWNER=%q\n' "$GITHUB_TRACK_OWNER"
-    printf 'GITHUB_TRACK_REPO=%q\n' "$GITHUB_TRACK_REPO"
-    printf 'GITHUB_TRACK_ISSUE=%q\n' "$GITHUB_TRACK_ISSUE"
     if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
         printf 'APPS=('
         for APP in "${ELIGIBLE_APPS[@]}"; do
@@ -626,27 +594,6 @@ NC='\033[0m'
 
 exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
 echo -e "${CYAN}Appending backup-runner output to: ${SCRIPT_LOG_FILE}${NC}"
-
-github_report() {
-    local event="$1"
-    local details="$2"
-    local host body escaped payload
-
-    [[ -n "${GITHUB_TOKEN:-}" ]] || return 0
-    command -v curl >/dev/null 2>&1 || return 0
-    host=$(hostname -f 2>/dev/null || hostname)
-    body="[backup-fix-run] ${event} | server=${host} | utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC') | ${details}"
-    escaped=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    payload="{\"body\":\"${escaped}\"}"
-    curl -fsS -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "https://api.github.com/repos/${GITHUB_TRACK_OWNER}/${GITHUB_TRACK_REPO}/issues/${GITHUB_TRACK_ISSUE}/comments" \
-        --data "$payload" >/dev/null \
-        && echo -e "${GREEN}Usage result recorded in GitHub issue #${GITHUB_TRACK_ISSUE}.${NC}" \
-        || echo -e "${YELLOW}GitHub usage-result tracking failed.${NC}"
-}
 
 to_readable() {
     awk -v b="${1:-0}" 'BEGIN{
@@ -821,17 +768,6 @@ if [[ "$FAIL" -eq 0 ]]; then
     echo -e "${GREEN}${BOLD}All backups completed successfully${NC}"
 else
     echo -e "${RED}${BOLD}One or more backups failed — see red lines above${NC}"
-fi
-RESULT_SUMMARY=""
-for i in "${!RESULT_APPS[@]}"; do
-    [[ -n "$RESULT_SUMMARY" ]] && RESULT_SUMMARY+="; "
-    RESULT_SUMMARY+="${RESULT_APPS[$i]}:exit-${RESULT_RC[$i]}"
-done
-[[ -n "$RESULT_SUMMARY" ]] || RESULT_SUMMARY="no app-specific results"
-if [[ "$FAIL" -eq 0 ]]; then
-    github_report "COMPLETED" "result=${RESULT_SUMMARY}; log=${SCRIPT_LOG_FILE}"
-else
-    github_report "FAILED" "result=${RESULT_SUMMARY}; log=${SCRIPT_LOG_FILE}"
 fi
 echo -e "${BOLD}Runner finished $(date '+%Y-%m-%d %H:%M:%S')  fail=${FAIL}${NC}"
 echo -e "${BOLD}==================================================${NC}"
