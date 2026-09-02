@@ -90,7 +90,7 @@ can_sudo_n() {
 
 setup_script_log() {
     local timestamp
-    timestamp=$(date '+%d-%m-%Y-%I-%M-%S-%p')
+    timestamp=$(LC_TIME=C date '+%d-%b-%Y-%I-%M%p')
     SCRIPT_LOG_FILE="${SCRIPT_LOG_DIR}/backup-log-${timestamp}.log"
 
     if ! run_priv install -d -m 0750 "$SCRIPT_LOG_DIR"; then
