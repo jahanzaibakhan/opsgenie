@@ -412,16 +412,25 @@ echo -e "${BOLD}▶ Step 7: CPU check + service relief if high${NC}"
 CPU_USAGE=$(cpu_usage_pct)
 echo -e "${YELLOW}CPU usage: ${CPU_USAGE}%${NC}"
 if [[ "$CPU_USAGE" =~ ^[0-9]+$ ]] && (( CPU_USAGE > CPU_THRESHOLD )); then
-    echo -e "${RED}CPU above ${CPU_THRESHOLD}% — restarting web/PHP/DB services that exist${NC}"
+    echo -e "${RED}CPU above ${CPU_THRESHOLD}% — restarting active web/PHP/DB services${NC}"
     restarted=0
-    for svc in apache2 nginx php-fpm php8.3-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm mysql mariadb; do
-        if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "${svc}.service"; then
-            if run_priv systemctl restart "$svc"; then
-                echo -e "${GREEN}  restarted ${svc}${NC}"
-                restarted=1
-            else
-                echo -e "${YELLOW}  could not restart ${svc}${NC}"
-            fi
+    ACTIVE_SERVICES=()
+    for svc in apache2 nginx mysql mariadb; do
+        if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
+            ACTIVE_SERVICES+=("$svc")
+        fi
+    done
+    while IFS= read -r svc; do
+        [[ -n "$svc" ]] && ACTIVE_SERVICES+=("${svc%.service}")
+    done < <(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null |
+        awk '$1 ~ /^php([0-9.]+)?-fpm\.service$/ {print $1}')
+
+    for svc in "${ACTIVE_SERVICES[@]}"; do
+        if run_priv systemctl restart "$svc"; then
+            echo -e "${GREEN}  restarted ${svc}${NC}"
+            restarted=1
+        else
+            echo -e "${YELLOW}  could not restart ${svc}${NC}"
         fi
     done
     if [[ "$restarted" -eq 0 ]]; then
