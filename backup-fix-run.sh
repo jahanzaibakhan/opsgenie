@@ -746,8 +746,8 @@ echo
 echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD} Backup result (from ${FACTS_FILE})${NC}"
 echo -e "${BOLD}==================================================${NC}"
-printf "${BOLD}%-8s %-22s %-14s %-s${NC}\n" "STATUS" "APP" "ERROR_CODE" "LAST BACKUP (date time)"
-printf "%-8s %-22s %-14s %-s\n" "------" "---" "----------" "----------------------"
+printf "${BOLD}%-12s %-22s %s${NC}\n" "STATUS" "APP" "LATEST BACKUP (UTC)"
+printf "%-12s %-22s %s\n" "------" "---" "-------------------"
 for i in "${!RESULT_APPS[@]}"; do
     APP="${RESULT_APPS[$i]}"
     rc="${RESULT_RC[$i]}"
@@ -756,9 +756,9 @@ for i in "${!RESULT_APPS[@]}"; do
     [[ -z "$err" ]] && err="n/a"
     [[ -z "$last" ]] && last="n/a"
     if [[ "$rc" -eq 0 && ( "$err" == "0" || "$err" == "n/a" ) ]]; then
-        echo -e "${GREEN}${BOLD}OK      ${NC}${GREEN}${APP}${NC}  error_code=${GREEN}${err}${NC}  last_backup=${GREEN}${last}${NC}"
+        printf "${GREEN}${BOLD}%-12s %-22s %s${NC}\n" "COMPLETED" "$APP" "$last"
     else
-        echo -e "${RED}${BOLD}FAILED  ${NC}${RED}${APP}${NC}  error_code=${RED}${err}${NC}  last_backup=${RED}${last}${NC}  exit=${rc}"
+        printf "${RED}${BOLD}%-12s %-22s %s${NC}\n" "FAILED" "$APP" "$last"
         FAIL=1
     fi
 done
