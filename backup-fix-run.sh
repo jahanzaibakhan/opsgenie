@@ -28,6 +28,8 @@ DUPLICITY_CACHE="/home/.duplicity"
 BACKUP_TEMP_DIR="${BACKUP_TEMP_DIR:-/tmp}"
 SCREEN_NAME="back"
 RUNNER="/tmp/opsgenie-backup-runner.sh"
+SCRIPT_LOG_DIR="/var/cw/system/backup-log"
+SCRIPT_LOG_FILE=""
 CPU_THRESHOLD=70
 SWAP_THRESHOLD=50
 SPACE_MULTIPLIER_PERCENT=120
@@ -82,6 +84,24 @@ run_priv() {
 can_sudo_n() {
     [[ "${EUID:-$(id -u)}" -eq 0 ]] && return 0
     have_cmd sudo && sudo -n true 2>/dev/null
+}
+
+setup_script_log() {
+    local timestamp
+    timestamp=$(date '+%d-%m-%Y-%I-%M-%S-%p')
+    SCRIPT_LOG_FILE="${SCRIPT_LOG_DIR}/backup-log-${timestamp}.log"
+
+    if ! run_priv install -d -m 0750 "$SCRIPT_LOG_DIR"; then
+        echo "Could not create log directory: $SCRIPT_LOG_DIR" >&2
+        exit 1
+    fi
+    if ! run_priv install -m 0640 -o "$(id -u)" -g "$(id -g)" /dev/null "$SCRIPT_LOG_FILE"; then
+        echo "Could not create log file: $SCRIPT_LOG_FILE" >&2
+        exit 1
+    fi
+
+    exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
+    echo -e "${CYAN}Script output log: ${SCRIPT_LOG_FILE}${NC}"
 }
 
 trim() {
@@ -198,6 +218,8 @@ screen_exists() {
     have_cmd screen || return 1
     screen -ls 2>/dev/null | grep -E "[[:space:]][0-9]+\.${SCREEN_NAME}[[:space:]]" >/dev/null
 }
+
+setup_script_log
 
 echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD} Backup diagnose + run (screen: ${SCREEN_NAME})${NC}"
@@ -547,6 +569,7 @@ fi
     printf 'DUPLICITY_CACHE=%q\n' "$DUPLICITY_CACHE"
     printf 'BACKUP_TEMP_DIR=%q\n' "$BACKUP_TEMP_DIR"
     printf 'SPACE_MULTIPLIER_PERCENT=%q\n' "$SPACE_MULTIPLIER_PERCENT"
+    printf 'SCRIPT_LOG_FILE=%q\n' "$SCRIPT_LOG_FILE"
     if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
         printf 'APPS=('
         for APP in "${ELIGIBLE_APPS[@]}"; do
@@ -568,6 +591,9 @@ YELLOW='\033[1;33m'
 CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
+
+exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
+echo -e "${CYAN}Appending backup-runner output to: ${SCRIPT_LOG_FILE}${NC}"
 
 to_readable() {
     awk -v b="${1:-0}" 'BEGIN{
