@@ -25,17 +25,26 @@ LOG_FILE="/var/log/backup.log"
 BACKUP_SCRIPT="/var/cw/scripts/bash/duplicity_backup.sh"
 APPS_PATH="/home/master/applications"
 DUPLICITY_CACHE="/home/.duplicity"
+BACKUP_TEMP_DIR="${BACKUP_TEMP_DIR:-/tmp}"
 SCREEN_NAME="back"
 RUNNER="/tmp/opsgenie-backup-runner.sh"
 CPU_THRESHOLD=70
 SWAP_THRESHOLD=50
+SPACE_MULTIPLIER_PERCENT=120
 
 ERROR_APPS=()
 ELIGIBLE_APPS=()
+KNOWN_APPS=()
 declare -A ERROR_CODES
 declare -A APP_TOTAL_BYTES
+declare -A APP_DB_BYTES
+declare -A APP_LAST_BACKUP
+declare -A APP_DUE_REASON
+declare -A APP_SEEN
 DISK_ERROR_FOUND=false
+DISK_PRESSURE_DETAILS=()
 REMARKS=()
+FREQUENCY_HOURS=24
 
 # curl | bash has no stdin TTY — always talk to the real terminal when present.
 TTY="/dev/tty"
@@ -73,6 +82,64 @@ run_priv() {
 can_sudo_n() {
     [[ "${EUID:-$(id -u)}" -eq 0 ]] && return 0
     have_cmd sudo && sudo -n true 2>/dev/null
+}
+
+trim() {
+    local value="${1:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+fact_timestamp_epoch() {
+    local timestamp="${1:-}"
+    local day month year hour minute
+    if [[ "$timestamp" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{4})[[:space:]]+([0-9]{2}):([0-9]{2})[[:space:]]+UTC$ ]]; then
+        day="${BASH_REMATCH[1]}"; month="${BASH_REMATCH[2]}"; year="${BASH_REMATCH[3]}"
+        hour="${BASH_REMATCH[4]}"; minute="${BASH_REMATCH[5]}"
+        date -u -d "${year}-${month}-${day} ${hour}:${minute}:00 UTC" +%s 2>/dev/null
+    fi
+}
+
+mount_info() {
+    local path="$1"
+    df -PB1 "$path" 2>/dev/null | awk 'NR==2 {print $1 "\t" $4 "\t" $6}'
+}
+
+required_space_bytes() {
+    local db_bytes="${1:-0}"
+    echo $(( db_bytes * SPACE_MULTIPLIER_PERCENT / 100 ))
+}
+
+capacity_check_app() {
+    local app="$1"
+    local required="${2:-0}"
+    local label path info filesystem available mount
+    local -A seen_mounts=()
+    local failed=0
+
+    [[ "$required" -gt 0 ]] || return 0
+    for label in "Database:/var/lib/mysql/$app" "Application:$APPS_PATH/$app" "Temporary:$BACKUP_TEMP_DIR" "Duplicity cache:$DUPLICITY_CACHE"; do
+        path="${label#*:}"
+        info=$(mount_info "$path")
+        if [[ -z "$info" ]]; then
+            echo -e "${RED}  ${label}: unable to determine filesystem capacity${NC}"
+            DISK_PRESSURE_DETAILS+=("${app} ${label}: filesystem capacity could not be determined")
+            failed=1
+            continue
+        fi
+        IFS=$'\t' read -r filesystem available mount <<< "$info"
+        [[ -n "${seen_mounts[$filesystem:$mount]:-}" ]] && continue
+        seen_mounts["$filesystem:$mount"]=1
+        if (( available >= required )); then
+            echo -e "${GREEN}  PASS ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+        else
+            echo -e "${RED}  FAIL ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+            DISK_PRESSURE_DETAILS+=("${app} ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")")
+            failed=1
+        fi
+    done
+    return "$failed"
 }
 
 to_bytes() {
@@ -173,17 +240,56 @@ if [[ -f "$FACTS_FILE" ]]; then
     done < "$FACTS_FILE"
 
     while IFS='=' read -r KEY VALUE || [[ -n "${KEY:-}" ]]; do
-        KEY=$(echo "${KEY:-}" | tr -d '[:space:]')
-        VALUE=$(echo "${VALUE:-}" | tr -d '[:space:]')
-        [[ "$KEY" =~ ^error_code_ ]] || continue
-        APP_NAME="${KEY#error_code_}"
-        [[ -z "$APP_NAME" ]] && continue
-        if [[ "$VALUE" =~ ^[0-9]+$ ]] && [[ "$VALUE" -ne 0 ]]; then
-            ERROR_APPS+=("$APP_NAME")
-            ERROR_CODES["$APP_NAME"]="$VALUE"
-            [[ "$VALUE" -ge 40 ]] && DISK_ERROR_FOUND=true
-        fi
+        KEY=$(trim "${KEY:-}")
+        VALUE=$(trim "${VALUE:-}")
+        case "$KEY" in
+            frequency)
+                if [[ "$VALUE" =~ ^[0-9]+$ ]] && (( VALUE > 0 )); then
+                    FREQUENCY_HOURS="$VALUE"
+                else
+                    echo -e "${YELLOW}Invalid frequency '${VALUE}'; using ${FREQUENCY_HOURS} hours${NC}"
+                fi
+                ;;
+            error_code_*)
+                APP_NAME="${KEY#error_code_}"
+                [[ -z "$APP_NAME" ]] && continue
+                APP_SEEN["$APP_NAME"]=1
+                ERROR_CODES["$APP_NAME"]="$VALUE"
+                if [[ "$VALUE" =~ ^[0-9]+$ ]] && [[ "$VALUE" -ne 0 ]]; then
+                    ERROR_APPS+=("$APP_NAME")
+                fi
+                ;;
+            last_backup_*)
+                APP_NAME="${KEY#last_backup_}"
+                [[ -z "$APP_NAME" ]] && continue
+                APP_SEEN["$APP_NAME"]=1
+                APP_LAST_BACKUP["$APP_NAME"]="$VALUE"
+                ;;
+        esac
     done < "$FACTS_FILE"
+
+    NOW_EPOCH=$(date -u +%s)
+    for APP_NAME in "${!APP_SEEN[@]}"; do
+        KNOWN_APPS+=("$APP_NAME")
+        LAST_BACKUP="${APP_LAST_BACKUP[$APP_NAME]:-}"
+        ERROR_CODE="${ERROR_CODES[$APP_NAME]:-0}"
+        if [[ "$ERROR_CODE" =~ ^[0-9]+$ ]] && (( ERROR_CODE != 0 )); then
+            APP_DUE_REASON["$APP_NAME"]="FAILED (error ${ERROR_CODE})"
+        elif [[ -z "$LAST_BACKUP" ]]; then
+            APP_DUE_REASON["$APP_NAME"]="MISSING LAST BACKUP"
+        else
+            LAST_EPOCH=$(fact_timestamp_epoch "$LAST_BACKUP")
+            if [[ ! "$LAST_EPOCH" =~ ^[0-9]+$ ]]; then
+                APP_DUE_REASON["$APP_NAME"]="UNPARSEABLE LAST BACKUP"
+            elif (( LAST_EPOCH > NOW_EPOCH + 300 )); then
+                APP_DUE_REASON["$APP_NAME"]="FUTURE LAST BACKUP"
+            elif (( NOW_EPOCH - LAST_EPOCH >= FREQUENCY_HOURS * 3600 )); then
+                APP_DUE_REASON["$APP_NAME"]="OVERDUE (${FREQUENCY_HOURS}h)"
+            else
+                APP_DUE_REASON["$APP_NAME"]="CURRENT"
+            fi
+        fi
+    done
 else
     echo -e "${RED}File not found: ${FACTS_FILE}${NC}"
     REMARKS+=("backup.fact missing")
@@ -203,10 +309,11 @@ if [[ -f "$LOG_FILE" ]]; then
                 NEED="${BASH_REMATCH[2]}"
                 if [[ "$AVAIL" =~ ^[0-9]+$ && "$NEED" =~ ^[0-9]+$ ]] && (( AVAIL < NEED )); then
                     DISK_ERROR_FOUND=true
+                    DISK_PRESSURE_DETAILS+=("backup.log temporary space: ${AVAIL} available, ${NEED} required")
                 fi
             fi
         fi
-    done < "$LOG_FILE"
+    done < <(tail -n 200 "$LOG_FILE")
     if [[ "$FOUND_ERRORS" == false ]]; then
         echo -e "${GREEN}No error lines in backup.log (showing last 30 lines)${NC}"
         tail -n 30 "$LOG_FILE"
@@ -230,40 +337,73 @@ while read -r FS SIZE USED AVAIL USEP MOUNT; do
     if (( USE >= 90 )); then
         echo -e "${RED}Filesystem ${FS} on ${MOUNT} is ${USEP} full${NC}"
         DISK_ERROR_FOUND=true
+        DISK_PRESSURE_DETAILS+=("${MOUNT} (${FS}) is ${USEP} full")
     fi
 done < <(df -P | awk 'NR>1 {print $1,$2,$3,$4,$5,$6}')
 
-# ---------- 6. Failed app sizes ----------
+# ---------- 6. Backup eligibility + app sizes ----------
 echo
-echo -e "${BOLD}▶ Step 6: Failed app file + DB sizes${NC}"
-if [[ ${#ERROR_APPS[@]} -eq 0 ]]; then
-    echo -e "${GREEN}No failed apps in backup.fact (error_code != 0)${NC}"
+echo -e "${BOLD}▶ Step 6: Backup eligibility + app file/DB sizes${NC}"
+echo "Schedule frequency: every ${FREQUENCY_HOURS} hour(s)"
+if [[ ${#KNOWN_APPS[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}No application entries found in backup.fact${NC}"
 else
-    printf "${BOLD}%-22s %-12s %-14s %-14s %-14s${NC}\n" "App" "Err" "Files" "DB" "Total"
-    printf "%-22s %-12s %-14s %-14s %-14s\n" "---" "---" "-----" "--" "-----"
-    for APP in "${ERROR_APPS[@]}"; do
+    printf "${BOLD}%-22s %-8s %-21s %-25s %-12s %-12s %-12s${NC}\n" "App" "Error" "Last backup (UTC)" "Status" "Files" "DB" "Total"
+    printf "%-22s %-8s %-21s %-25s %-12s %-12s %-12s\n" "---" "-----" "-----------------" "------" "-----" "--" "-----"
+    while IFS= read -r APP; do
         FILE_SIZE="N/A"
         FILE_BYTES=0
         DB_SIZE="0"
         DB_BYTES=0
         if [[ -d "$APPS_PATH/$APP" ]]; then
-            FILE_SIZE=$(du -sh "$APPS_PATH/$APP" 2>/dev/null | awk '{print $1}')
+            FILE_SIZE=$(run_priv du -sh "$APPS_PATH/$APP" 2>/dev/null | awk '{print $1}')
             FILE_BYTES=$(to_bytes "$FILE_SIZE")
         fi
         if [[ -d "/var/lib/mysql/$APP" ]]; then
-            DB_SIZE=$(du -sh "/var/lib/mysql/$APP" 2>/dev/null | awk '{print $1}')
+            DB_SIZE=$(run_priv du -sh "/var/lib/mysql/$APP" 2>/dev/null | awk '{print $1}')
             DB_BYTES=$(to_bytes "$DB_SIZE")
         fi
         TOTAL_BYTES=$(( FILE_BYTES + DB_BYTES ))
         APP_TOTAL_BYTES["$APP"]=$TOTAL_BYTES
-        printf "${RED}%-22s${NC} %-12s %-14s %-14s %-14s\n" \
-            "$APP" "${ERROR_CODES[$APP]}" "$FILE_SIZE" "$DB_SIZE" "$(to_readable "$TOTAL_BYTES")"
-        if [[ "$TOTAL_BYTES" -gt 0 ]]; then
+        APP_DB_BYTES["$APP"]=$DB_BYTES
+        STATUS="${APP_DUE_REASON[$APP]}"
+        ERROR_CODE="${ERROR_CODES[$APP]:-0}"
+        LAST_BACKUP="${APP_LAST_BACKUP[$APP]:-n/a}"
+        if [[ "$STATUS" == "FAILED"* || "$STATUS" == "OVERDUE"* ]]; then
+            STATUS_COLOR="$YELLOW"
+        elif [[ "$STATUS" == "CURRENT" ]]; then
+            STATUS_COLOR="$GREEN"
+        else
+            STATUS_COLOR="$RED"
+        fi
+        printf "%-22s %-8s %-21s ${STATUS_COLOR}%-25s${NC} %-12s %-12s %-12s\n" \
+            "$APP" "$ERROR_CODE" "$LAST_BACKUP" "$STATUS" "$FILE_SIZE" "$DB_SIZE" "$(to_readable "$TOTAL_BYTES")"
+        if [[ ( "$STATUS" == "FAILED"* || "$STATUS" == "OVERDUE"* ) && "$TOTAL_BYTES" -gt 0 ]]; then
             ELIGIBLE_APPS+=("$APP")
         else
-            echo -e "${YELLOW}  skip ${APP}: file+DB size is 0${NC}"
+            [[ "$STATUS" == "CURRENT" ]] || echo -e "${YELLOW}  not queued ${APP}: ${STATUS}${NC}"
+        fi
+    done < <(printf '%s\n' "${KNOWN_APPS[@]}" | sort)
+fi
+
+# ---------- 6b. Capacity guard ----------
+SPACE_SKIPPED_APPS=()
+if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
+    echo
+    echo -e "${BOLD}▶ Step 6b: Per-app backup capacity check (120% of database size)${NC}"
+    CAPACITY_ELIGIBLE_APPS=()
+    for APP in "${ELIGIBLE_APPS[@]}"; do
+        DB_BYTES="${APP_DB_BYTES[$APP]:-0}"
+        REQUIRED_BYTES=$(required_space_bytes "$DB_BYTES")
+        echo -e "${CYAN}${APP}: DB $(to_readable "$DB_BYTES"), required free space $(to_readable "$REQUIRED_BYTES")${NC}"
+        if capacity_check_app "$APP" "$REQUIRED_BYTES"; then
+            CAPACITY_ELIGIBLE_APPS+=("$APP")
+        else
+            SPACE_SKIPPED_APPS+=("$APP")
+            DISK_ERROR_FOUND=true
         fi
     done
+    ELIGIBLE_APPS=("${CAPACITY_ELIGIBLE_APPS[@]}")
 fi
 
 # ---------- 7. CPU remediations ----------
@@ -335,18 +475,28 @@ for r in "${REMARKS[@]}"; do
     echo " - $r"
 done
 if [[ "$DISK_ERROR_FOUND" == true ]]; then
-    echo -e "${RED} - Disk / temp-space pressure detected. Backup may still fail until space is freed.${NC}"
+    echo -e "${RED} - Disk capacity warnings:${NC}"
+    for detail in "${DISK_PRESSURE_DETAILS[@]}"; do
+        echo -e "${RED}   - ${detail}${NC}"
+    done
 fi
 if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
-    echo -e "${YELLOW} - Failed apps with data: ${ELIGIBLE_APPS[*]}${NC}"
+    echo -e "${YELLOW} - Failed or overdue apps queued: ${ELIGIBLE_APPS[*]}${NC}"
+elif [[ ${#SPACE_SKIPPED_APPS[@]} -gt 0 ]]; then
+    echo -e "${RED} - Apps not queued due to insufficient required-mount space: ${SPACE_SKIPPED_APPS[*]}${NC}"
 elif [[ ${#ERROR_APPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW} - Failed apps listed but all have zero size${NC}"
 else
-    echo -e "${GREEN} - No failed apps in facts file${NC}"
+    echo -e "${GREEN} - No failed or overdue apps found in facts file${NC}"
 fi
 echo
 
 # ---------- Confirm + screen ----------
+if [[ ${#ELIGIBLE_APPS[@]} -eq 0 && ${#KNOWN_APPS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}No backup started: all known apps are current, need review, have no data, or failed the capacity check.${NC}"
+    exit 0
+fi
+
 if ! ask_yn "${BOLD}Diagnosis finished. Run backup now in screen named ${CYAN}${SCREEN_NAME}${NC}${BOLD}?${NC}"; then
     echo -e "${YELLOW}Backup not started. You can re-run this script later.${NC}"
     exit 0
@@ -384,6 +534,10 @@ fi
     printf 'BACKUP_SCRIPT=%q\n' "$BACKUP_SCRIPT"
     printf 'FACTS_FILE=%q\n' "$FACTS_FILE"
     printf 'SCREEN_NAME=%q\n' "$SCREEN_NAME"
+    printf 'APPS_PATH=%q\n' "$APPS_PATH"
+    printf 'DUPLICITY_CACHE=%q\n' "$DUPLICITY_CACHE"
+    printf 'BACKUP_TEMP_DIR=%q\n' "$BACKUP_TEMP_DIR"
+    printf 'SPACE_MULTIPLIER_PERCENT=%q\n' "$SPACE_MULTIPLIER_PERCENT"
     if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
         printf 'APPS=('
         for APP in "${ELIGIBLE_APPS[@]}"; do
@@ -391,9 +545,12 @@ fi
         done
         printf ' )\n'
         echo 'FULL_BACKUP=0'
-    else
+    elif [[ ${#KNOWN_APPS[@]} -eq 0 ]]; then
         echo 'APPS=()'
         echo 'FULL_BACKUP=1'
+    else
+        echo 'APPS=()'
+        echo 'FULL_BACKUP=0'
     fi
     cat << 'RUNNER_BODY'
 RED='\033[1;31m'
@@ -402,6 +559,46 @@ YELLOW='\033[1;33m'
 CYAN='\033[1;36m'
 BOLD='\033[1m'
 NC='\033[0m'
+
+to_readable() {
+    awk -v b="${1:-0}" 'BEGIN{
+        if (b >= 1073741824) printf "%.2fG", b/1073741824
+        else if (b >= 1048576) printf "%.2fM", b/1048576
+        else if (b >= 1024) printf "%.2fK", b/1024
+        else printf "%dB", b
+    }'
+}
+
+capacity_check_app() {
+    local app="$1" db_bytes required label path info filesystem available mount
+    local -A seen_mounts=()
+    local failed=0
+    db_bytes=$(sudo du -sxB1 "/var/lib/mysql/$app" 2>/dev/null | awk '{print $1}')
+    db_bytes=${db_bytes:-0}
+    required=$(( db_bytes * SPACE_MULTIPLIER_PERCENT / 100 ))
+    [[ "$required" -gt 0 ]] || return 0
+
+    echo -e "${CYAN}Capacity re-check for ${app}: DB $(to_readable "$db_bytes"), need $(to_readable "$required") free${NC}"
+    for label in "Database:/var/lib/mysql/$app" "Application:$APPS_PATH/$app" "Temporary:$BACKUP_TEMP_DIR" "Duplicity cache:$DUPLICITY_CACHE"; do
+        path="${label#*:}"
+        info=$(df -PB1 "$path" 2>/dev/null | awk 'NR==2 {print $1 "\t" $4 "\t" $6}')
+        if [[ -z "$info" ]]; then
+            echo -e "${RED}  FAIL ${label}: cannot determine filesystem capacity${NC}"
+            failed=1
+            continue
+        fi
+        IFS=$'\t' read -r filesystem available mount <<< "$info"
+        [[ -n "${seen_mounts[$filesystem:$mount]:-}" ]] && continue
+        seen_mounts["$filesystem:$mount"]=1
+        if (( available >= required )); then
+            echo -e "${GREEN}  PASS ${label} (${mount}): free $(to_readable "$available")${NC}"
+        else
+            echo -e "${RED}  FAIL ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
 
 fact_val() {
     local key="$1"
@@ -493,6 +690,12 @@ else
     for APP in "${APPS[@]}"; do
         echo
         echo -e "${CYAN}${BOLD}▶ Backup ${APP} ...${NC}"
+        if ! capacity_check_app "$APP"; then
+            echo -e "${RED}${BOLD}SKIPPED: ${APP} no longer has sufficient free space for a safe backup.${NC}"
+            RESULT_APPS+=("$APP"); RESULT_RC+=("2")
+            FAIL=1
+            continue
+        fi
         if sudo "$BACKUP_SCRIPT" -a "$APP"; then
             rc=0
         else
