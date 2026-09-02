@@ -36,6 +36,8 @@ SPACE_MULTIPLIER_PERCENT=120
 
 ERROR_APPS=()
 ELIGIBLE_APPS=()
+OVERDUE_APPS=()
+REMOVED_APPS=()
 KNOWN_APPS=()
 declare -A ERROR_CODES
 declare -A APP_TOTAL_BYTES
@@ -219,12 +221,52 @@ screen_exists() {
     screen -ls 2>/dev/null | grep -E "[[:space:]][0-9]+\.${SCREEN_NAME}[[:space:]]" >/dev/null
 }
 
+stop_existing_backups() {
+    local pid
+    local -a backup_pids=()
+
+    echo
+    echo -e "${BOLD}▶ Preflight: stopping existing backup processes${NC}"
+    while IFS= read -r pid; do
+        [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+        backup_pids+=("$pid")
+    done < <(pgrep -f '/var/cw/scripts/bash/duplicity_backup\.sh|(^|[[:space:]/])duplicity([[:space:]]|$)' 2>/dev/null || true)
+
+    if [[ ${#backup_pids[@]} -eq 0 ]]; then
+        echo -e "${GREEN}No existing duplicity backup process found.${NC}"
+    else
+        echo -e "${YELLOW}Stopping existing backup process(es):${NC}"
+        run_priv ps -fp "${backup_pids[@]}" || true
+        run_priv kill -TERM "${backup_pids[@]}" 2>/dev/null || true
+        sleep 5
+
+        local -a remaining_pids=()
+        for pid in "${backup_pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && remaining_pids+=("$pid")
+        done
+        if [[ ${#remaining_pids[@]} -gt 0 ]]; then
+            echo -e "${RED}Force-stopping backup process(es): ${remaining_pids[*]}${NC}"
+            run_priv kill -KILL "${remaining_pids[@]}" 2>/dev/null || true
+        fi
+        REMARKS+=("Stopped existing backup process(es): ${backup_pids[*]}")
+    fi
+
+    if screen_exists; then
+        echo -e "${YELLOW}Stopping existing screen session '${SCREEN_NAME}'.${NC}"
+        screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
+        sleep 1
+        REMARKS+=("Stopped existing screen session: ${SCREEN_NAME}")
+    fi
+}
+
 setup_script_log
 
 echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD} Backup diagnose + run (screen: ${SCREEN_NAME})${NC}"
 echo -e "${BOLD} $(date '+%Y-%m-%d %H:%M:%S')${NC}"
 echo -e "${BOLD}==================================================${NC}"
+
+stop_existing_backups
 
 # ---------- 1. Duplicity cache ----------
 echo
@@ -295,7 +337,11 @@ if [[ -f "$FACTS_FILE" ]]; then
         KNOWN_APPS+=("$APP_NAME")
         LAST_BACKUP="${APP_LAST_BACKUP[$APP_NAME]:-}"
         ERROR_CODE="${ERROR_CODES[$APP_NAME]:-0}"
-        if [[ "$ERROR_CODE" =~ ^[0-9]+$ ]] && (( ERROR_CODE != 0 )); then
+        if [[ "$ERROR_CODE" =~ ^[0-9]+$ ]] && (( ERROR_CODE != 0 )) &&
+            [[ ! -d "$APPS_PATH/$APP_NAME" && ! -d "/var/lib/mysql/$APP_NAME" ]]; then
+            APP_DUE_REASON["$APP_NAME"]="REMOVED (app and DB paths missing)"
+            REMOVED_APPS+=("$APP_NAME")
+        elif [[ "$ERROR_CODE" =~ ^[0-9]+$ ]] && (( ERROR_CODE != 0 )); then
             APP_DUE_REASON["$APP_NAME"]="FAILED (error ${ERROR_CODE})"
         elif [[ -z "$LAST_BACKUP" ]]; then
             APP_DUE_REASON["$APP_NAME"]="MISSING LAST BACKUP"
@@ -307,6 +353,7 @@ if [[ -f "$FACTS_FILE" ]]; then
                 APP_DUE_REASON["$APP_NAME"]="FUTURE LAST BACKUP"
             elif (( NOW_EPOCH - LAST_EPOCH >= FREQUENCY_HOURS * 3600 )); then
                 APP_DUE_REASON["$APP_NAME"]="OVERDUE (${FREQUENCY_HOURS}h)"
+                OVERDUE_APPS+=("$APP_NAME")
             else
                 APP_DUE_REASON["$APP_NAME"]="CURRENT"
             fi
@@ -363,12 +410,12 @@ while read -r FS SIZE USED AVAIL USEP MOUNT; do
     fi
 done < <(df -P | awk 'NR>1 {print $1,$2,$3,$4,$5,$6}')
 
-# ---------- 6. Backup eligibility + app sizes ----------
+# ---------- 6. Failed-app file and database checks ----------
 echo
-echo -e "${BOLD}▶ Step 6: Backup eligibility + app file/DB sizes${NC}"
+echo -e "${BOLD}▶ Step 6: Failed-app file and database checks${NC}"
 echo "Schedule frequency: every ${FREQUENCY_HOURS} hour(s)"
-if [[ ${#KNOWN_APPS[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}No application entries found in backup.fact${NC}"
+if [[ ${#ERROR_APPS[@]} -eq 0 ]]; then
+    echo -e "${GREEN}No failed apps in backup.fact. Overdue apps will be checked after failed-app processing.${NC}"
 else
     printf "${BOLD}%-22s %-8s %-21s %-25s %-12s %-12s %-12s${NC}\n" "App" "Error" "Last backup (UTC)" "Status" "Files" "DB" "Total"
     printf "%-22s %-8s %-21s %-25s %-12s %-12s %-12s\n" "---" "-----" "-----------------" "------" "-----" "--" "-----"
@@ -391,21 +438,23 @@ else
         STATUS="${APP_DUE_REASON[$APP]}"
         ERROR_CODE="${ERROR_CODES[$APP]:-0}"
         LAST_BACKUP="${APP_LAST_BACKUP[$APP]:-n/a}"
-        if [[ "$STATUS" == "FAILED"* || "$STATUS" == "OVERDUE"* ]]; then
+        if [[ "$STATUS" == "FAILED"* ]]; then
             STATUS_COLOR="$YELLOW"
-        elif [[ "$STATUS" == "CURRENT" ]]; then
-            STATUS_COLOR="$GREEN"
         else
             STATUS_COLOR="$RED"
         fi
         printf "%-22s %-8s %-21s ${STATUS_COLOR}%-25s${NC} %-12s %-12s %-12s\n" \
             "$APP" "$ERROR_CODE" "$LAST_BACKUP" "$STATUS" "$FILE_SIZE" "$DB_SIZE" "$(to_readable "$TOTAL_BYTES")"
-        if [[ ( "$STATUS" == "FAILED"* || "$STATUS" == "OVERDUE"* ) && "$TOTAL_BYTES" -gt 0 ]]; then
+        if [[ "$STATUS" == "FAILED"* && "$TOTAL_BYTES" -gt 0 ]]; then
             ELIGIBLE_APPS+=("$APP")
         else
-            [[ "$STATUS" == "CURRENT" ]] || echo -e "${YELLOW}  not queued ${APP}: ${STATUS}${NC}"
+            if [[ "$STATUS" == "REMOVED"* ]]; then
+                echo -e "${RED}  removed ${APP}: application and database paths are both missing; backup skipped.${NC}"
+            else
+                echo -e "${YELLOW}  not queued ${APP}: ${STATUS}${NC}"
+            fi
         fi
-    done < <(printf '%s\n' "${KNOWN_APPS[@]}" | sort)
+    done < <(printf '%s\n' "${ERROR_APPS[@]}" | sort)
 fi
 
 # ---------- 6b. Capacity guard ----------
@@ -512,18 +561,25 @@ if [[ "$DISK_ERROR_FOUND" == true ]]; then
     done
 fi
 if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
-    echo -e "${YELLOW} - Failed or overdue apps queued: ${ELIGIBLE_APPS[*]}${NC}"
-elif [[ ${#SPACE_SKIPPED_APPS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW} - Failed apps queued first: ${ELIGIBLE_APPS[*]}${NC}"
+fi
+if [[ ${#OVERDUE_APPS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW} - Overdue apps queued after failed-app backups: ${OVERDUE_APPS[*]}${NC}"
+fi
+if [[ ${#REMOVED_APPS[@]} -gt 0 ]]; then
+    echo -e "${RED} - Removed apps skipped: ${REMOVED_APPS[*]}${NC}"
+fi
+if [[ ${#SPACE_SKIPPED_APPS[@]} -gt 0 ]]; then
     echo -e "${RED} - Apps not queued due to insufficient required-mount space: ${SPACE_SKIPPED_APPS[*]}${NC}"
-elif [[ ${#ERROR_APPS[@]} -gt 0 ]]; then
+elif [[ ${#ERROR_APPS[@]} -gt 0 && ${#ELIGIBLE_APPS[@]} -eq 0 ]]; then
     echo -e "${YELLOW} - Failed apps listed but all have zero size${NC}"
-else
+elif [[ ${#ERROR_APPS[@]} -eq 0 && ${#OVERDUE_APPS[@]} -eq 0 ]]; then
     echo -e "${GREEN} - No failed or overdue apps found in facts file${NC}"
 fi
 echo
 
 # ---------- Confirm + screen ----------
-if [[ ${#ELIGIBLE_APPS[@]} -eq 0 && ${#KNOWN_APPS[@]} -gt 0 ]]; then
+if [[ ${#ELIGIBLE_APPS[@]} -eq 0 && ${#OVERDUE_APPS[@]} -eq 0 && ${#KNOWN_APPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}No backup started: all known apps are current, need review, have no data, or failed the capacity check.${NC}"
     exit 0
 fi
@@ -544,18 +600,12 @@ if ! have_cmd screen; then
 fi
 
 if screen_exists; then
-    echo -e "${YELLOW}Screen session '${SCREEN_NAME}' already exists.${NC}"
-    echo "  Attach: screen -r ${SCREEN_NAME}"
-    if ask_yn "Kill the existing '${SCREEN_NAME}' session and start a new backup"; then
-        screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
-        sleep 1
-        if screen_exists; then
-            echo -e "${RED}Could not stop existing screen '${SCREEN_NAME}'. Attach and stop it manually.${NC}"
-            exit 1
-        fi
-    else
-        echo -e "${CYAN}Leaving existing session. Attach with: screen -r ${SCREEN_NAME}${NC}"
-        exit 0
+    echo -e "${YELLOW}Stopping remaining screen session '${SCREEN_NAME}' before starting the new backup.${NC}"
+    screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
+    sleep 1
+    if screen_exists; then
+        echo -e "${RED}Could not stop existing screen '${SCREEN_NAME}'. Attach and stop it manually.${NC}"
+        exit 1
     fi
 fi
 
@@ -570,6 +620,11 @@ fi
     printf 'BACKUP_TEMP_DIR=%q\n' "$BACKUP_TEMP_DIR"
     printf 'SPACE_MULTIPLIER_PERCENT=%q\n' "$SPACE_MULTIPLIER_PERCENT"
     printf 'SCRIPT_LOG_FILE=%q\n' "$SCRIPT_LOG_FILE"
+    printf 'OVERDUE_APPS=('
+    for APP in "${OVERDUE_APPS[@]}"; do
+        printf ' %q' "$APP"
+    done
+    printf ' )\n'
     if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
         printf 'APPS=('
         for APP in "${ELIGIBLE_APPS[@]}"; do
@@ -724,7 +779,7 @@ if [[ "$FULL_BACKUP" -eq 1 ]]; then
 else
     for APP in "${APPS[@]}"; do
         echo
-        echo -e "${CYAN}${BOLD}▶ Backup ${APP} ...${NC}"
+        echo -e "${CYAN}${BOLD}▶ Failed-app backup ${APP} ...${NC}"
         if ! capacity_check_app "$APP"; then
             echo -e "${RED}${BOLD}SKIPPED: ${APP} no longer has sufficient free space for a safe backup.${NC}"
             RESULT_APPS+=("$APP"); RESULT_RC+=("2")
@@ -740,6 +795,35 @@ else
         RESULT_APPS+=("$APP"); RESULT_RC+=("$rc")
         print_app_report "$APP" "$rc"
     done
+
+    if [[ ${#OVERDUE_APPS[@]} -gt 0 ]]; then
+        echo
+        echo -e "${BOLD}▶ Checking overdue apps after failed-app backups${NC}"
+        for APP in "${OVERDUE_APPS[@]}"; do
+            echo
+            if [[ ! -d "$APPS_PATH/$APP" && ! -d "/var/lib/mysql/$APP" ]]; then
+                echo -e "${RED}${BOLD}REMOVED: ${APP} application and database paths are missing; backup skipped.${NC}"
+                RESULT_APPS+=("$APP"); RESULT_RC+=("3")
+                FAIL=1
+                continue
+            fi
+            echo -e "${CYAN}${BOLD}▶ Overdue-app backup ${APP} ...${NC}"
+            if ! capacity_check_app "$APP"; then
+                echo -e "${RED}${BOLD}SKIPPED: ${APP} no longer has sufficient free space for a safe backup.${NC}"
+                RESULT_APPS+=("$APP"); RESULT_RC+=("2")
+                FAIL=1
+                continue
+            fi
+            if sudo "$BACKUP_SCRIPT" -a "$APP"; then
+                rc=0
+            else
+                rc=$?
+                FAIL=1
+            fi
+            RESULT_APPS+=("$APP"); RESULT_RC+=("$rc")
+            print_app_report "$APP" "$rc"
+        done
+    fi
 fi
 
 echo
