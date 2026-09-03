@@ -31,6 +31,7 @@ RUNNER="/tmp/opsgenie-backup-runner.sh"
 SCRIPT_LOG_DIR="/var/cw/systeam/backup-log"
 SCRIPT_LOG_FILE=""
 BACKUP_REPORT_CONFIG="/etc/backup-reporting.env"
+BACKUP_REPORT_URL_DEFAULT="https://backups.jhanzaib.online/api"
 CPU_THRESHOLD=70
 SWAP_THRESHOLD=50
 SPACE_MULTIPLIER_PERCENT=120
@@ -88,6 +89,34 @@ run_priv() {
 can_sudo_n() {
     [[ "${EUID:-$(id -u)}" -eq 0 ]] && return 0
     have_cmd sudo && sudo -n true 2>/dev/null
+}
+
+setup_runtime_reporting() {
+    local code server_ip hostname payload response
+
+    [[ -r "$BACKUP_REPORT_CONFIG" ]] && return 0
+    echo
+    read -rp "Optional: paste one-time backup dashboard setup code (Enter to skip reporting): " code <"$TTY"
+    [[ -n "$code" ]] || return 0
+
+    server_ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    payload="{\"code\":\"${code}\",\"serverIp\":\"${server_ip}\",\"hostname\":\"${hostname}\"}"
+    response=$(curl -fsS --connect-timeout 10 --max-time 30 \
+        -X POST "${BACKUP_REPORT_URL_DEFAULT}/register" \
+        -H "Content-Type: application/json" --data "$payload" 2>/dev/null) || {
+        echo -e "${YELLOW}Dashboard registration failed; backup will run without central reporting.${NC}"
+        return 0
+    }
+    BACKUP_REPORT_TOKEN=$(printf '%s' "$response" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    if [[ -z "$BACKUP_REPORT_TOKEN" ]]; then
+        echo -e "${YELLOW}Dashboard registration returned no token; backup will run without central reporting.${NC}"
+        return 0
+    fi
+    export BACKUP_REPORT_TOKEN
+    BACKUP_REPORT_URL="${BACKUP_REPORT_URL_DEFAULT}/reports"
+    export BACKUP_REPORT_URL
+    echo -e "${GREEN}Dashboard reporting enabled for this backup run.${NC}"
 }
 
 setup_script_log() {
@@ -277,6 +306,7 @@ stop_existing_backups() {
 }
 
 setup_script_log
+setup_runtime_reporting
 
 echo -e "${BOLD}==================================================${NC}"
 echo -e "${BOLD} Backup diagnose + run (screen: ${SCREEN_NAME})${NC}"
@@ -696,11 +726,13 @@ json_escape() {
 report_backup_result() {
     local server_ip hostname completed_at items="" item_sep="" app rc app_status last payload
 
-    [[ -r "$BACKUP_REPORT_CONFIG" ]] || return 0
-    # This root-owned file supplies BACKUP_REPORT_URL, BACKUP_REPORT_TOKEN, and
-    # optionally BACKUP_SERVER_IP. The token is never written into this runner.
-    # shellcheck disable=SC1090
-    source "$BACKUP_REPORT_CONFIG"
+    if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
+        # This root-owned file supplies BACKUP_REPORT_URL, BACKUP_REPORT_TOKEN,
+        # and optionally BACKUP_SERVER_IP. A registration token is otherwise
+        # inherited in memory from the parent process and never written here.
+        # shellcheck disable=SC1090
+        source "$BACKUP_REPORT_CONFIG"
+    fi
     if [[ -z "${BACKUP_REPORT_URL:-}" || -z "${BACKUP_REPORT_TOKEN:-}" ]]; then
         echo -e "${YELLOW}Backup reporting skipped: incomplete ${BACKUP_REPORT_CONFIG}.${NC}"
         return 0
@@ -732,6 +764,7 @@ report_backup_result() {
     else
         echo -e "${YELLOW}Backup reporting failed; the local backup result is still in ${SCRIPT_LOG_FILE}.${NC}"
     fi
+    unset BACKUP_REPORT_TOKEN
 }
 
 to_readable() {
