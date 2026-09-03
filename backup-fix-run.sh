@@ -92,9 +92,13 @@ can_sudo_n() {
 }
 
 setup_runtime_reporting() {
-    local code server_ip hostname payload response
+    local code server_ip hostname payload response config_tmp
 
-    [[ -r "$BACKUP_REPORT_CONFIG" ]] && return 0
+    if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
+        # shellcheck disable=SC1090
+        source "$BACKUP_REPORT_CONFIG"
+        return 0
+    fi
     echo
     read -rp "Optional: paste one-time backup dashboard setup code (Enter to skip reporting): " code <"$TTY"
     [[ -n "$code" ]] || return 0
@@ -116,7 +120,36 @@ setup_runtime_reporting() {
     export BACKUP_REPORT_TOKEN
     BACKUP_REPORT_URL="${BACKUP_REPORT_URL_DEFAULT}/reports"
     export BACKUP_REPORT_URL
-    echo -e "${GREEN}Dashboard reporting enabled for this backup run.${NC}"
+    BACKUP_SERVER_IP="$server_ip"
+    config_tmp=$(mktemp)
+    {
+        printf 'BACKUP_REPORT_URL=%q\n' "$BACKUP_REPORT_URL"
+        printf 'BACKUP_REPORT_TOKEN=%q\n' "$BACKUP_REPORT_TOKEN"
+        printf 'BACKUP_SERVER_IP=%q\n' "$BACKUP_SERVER_IP"
+    } > "$config_tmp"
+    if run_priv install -m 0600 -o root -g root "$config_tmp" "$BACKUP_REPORT_CONFIG"; then
+        rm -f "$config_tmp"
+        echo -e "${GREEN}Dashboard reporting is configured for future backup runs.${NC}"
+    else
+        rm -f "$config_tmp"
+        echo -e "${YELLOW}Could not save ${BACKUP_REPORT_CONFIG}; reporting is enabled only for this run.${NC}"
+    fi
+}
+
+send_no_action_report() {
+    local hostname completed_at payload
+    [[ -n "${BACKUP_REPORT_URL:-}" && -n "${BACKUP_REPORT_TOKEN:-}" ]] || return 0
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    completed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    payload="{\"serverIp\":\"${BACKUP_SERVER_IP:-unknown}\",\"hostname\":\"${hostname}\",\"status\":\"NO_ACTION\",\"startedAt\":\"${BACKUP_STARTED_AT}\",\"completedAt\":\"${completed_at}\",\"apps\":[]}"
+    if curl -fsS --connect-timeout 10 --max-time 30 \
+        -X POST "$BACKUP_REPORT_URL" \
+        -H "Authorization: Bearer ${BACKUP_REPORT_TOKEN}" \
+        -H "Content-Type: application/json" --data "$payload" >/dev/null; then
+        echo -e "${GREEN}No-action backup status sent to the central dashboard.${NC}"
+    else
+        echo -e "${YELLOW}No-action dashboard reporting failed.${NC}"
+    fi
 }
 
 setup_script_log() {
@@ -648,6 +681,7 @@ echo
 # ---------- Confirm + screen ----------
 if [[ ${#ELIGIBLE_APPS[@]} -eq 0 && ${#OVERDUE_APPS[@]} -eq 0 && ${#KNOWN_APPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}No backup started: all known apps are current, need review, have no data, or failed the capacity check.${NC}"
+    send_no_action_report
     exit 0
 fi
 
