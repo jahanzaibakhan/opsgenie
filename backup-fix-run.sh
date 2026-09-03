@@ -1,7 +1,8 @@
 #!/bin/bash
 # backup-fix-run.sh
 # Diagnose Cloudways backup failures, apply safe remediations, then optionally
-# start duplicity backup inside a detached GNU screen named "back".
+# start duplicity backup inside a detached GNU screen named "back". The
+# session closes automatically after the backup, reporting, and logging finish.
 #
 # Usage:
 #   curl -s https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/backup-fix-run.sh | bash
@@ -1019,8 +1020,8 @@ fi
 report_backup_result
 echo -e "${BOLD}Runner finished $(date '+%Y-%m-%d %H:%M:%S')  fail=${FAIL}${NC}"
 echo -e "${BOLD}==================================================${NC}"
-echo "This window stays open. Detach: Ctrl+A then D"
-exec bash
+echo "Backup run complete. This screen session is closing; see the dashboard and ${SCRIPT_LOG_FILE} for details."
+exit "$FAIL"
 RUNNER_BODY
 } > "$RUNNER"
 chmod 700 "$RUNNER"
@@ -1068,4 +1069,5 @@ echo
 echo -e "${CYAN}Attach:  screen -r ${SCREEN_NAME}${NC}"
 echo -e "${CYAN}Detach:  Ctrl+A then D${NC}"
 echo -e "${CYAN}List:    screen -ls${NC}"
+echo -e "${CYAN}The screen session closes automatically once the backup result is reported and logged.${NC}"
 echo
