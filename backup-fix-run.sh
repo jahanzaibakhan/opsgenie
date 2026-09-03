@@ -93,7 +93,7 @@ can_sudo_n() {
 }
 
 setup_runtime_reporting() {
-    local code report_token server_ip hostname payload response config_tmp
+    local code server_ip hostname payload response config_tmp
 
     if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
         # shellcheck disable=SC1090
@@ -108,17 +108,6 @@ setup_runtime_reporting() {
         return 0
     fi
     echo
-    read -rsp "Optional: paste backup dashboard token (input is hidden; Enter for setup code/skip): " report_token <"$TTY"
-    echo >"$TTY"
-    if [[ -n "$report_token" ]]; then
-        BACKUP_REPORT_TOKEN="$report_token"
-        BACKUP_REPORT_URL="${BACKUP_REPORT_URL_DEFAULT}/reports"
-        BACKUP_SERVER_IP="$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
-        export BACKUP_REPORT_URL BACKUP_REPORT_TOKEN BACKUP_SERVER_IP
-        unset report_token
-        echo -e "${GREEN}Dashboard reporting is enabled for this run only; the token will not be saved.${NC}"
-        return 0
-    fi
     read -rp "Optional: paste one-time backup dashboard setup code (Enter to skip reporting): " code <"$TTY"
     [[ -n "$code" ]] || return 0
 
