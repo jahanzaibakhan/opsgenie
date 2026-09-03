@@ -30,6 +30,7 @@ SCREEN_NAME="back"
 RUNNER="/tmp/opsgenie-backup-runner.sh"
 SCRIPT_LOG_DIR="/var/cw/systeam/backup-log"
 SCRIPT_LOG_FILE=""
+BACKUP_REPORT_CONFIG="/etc/backup-reporting.env"
 CPU_THRESHOLD=70
 SWAP_THRESHOLD=50
 SPACE_MULTIPLIER_PERCENT=120
@@ -49,6 +50,7 @@ DISK_ERROR_FOUND=false
 DISK_PRESSURE_DETAILS=()
 REMARKS=()
 FREQUENCY_HOURS=24
+BACKUP_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # curl | bash has no stdin TTY — always talk to the real terminal when present.
 TTY="/dev/tty"
@@ -655,6 +657,8 @@ fi
     printf 'BACKUP_TEMP_DIR=%q\n' "$BACKUP_TEMP_DIR"
     printf 'SPACE_MULTIPLIER_PERCENT=%q\n' "$SPACE_MULTIPLIER_PERCENT"
     printf 'SCRIPT_LOG_FILE=%q\n' "$SCRIPT_LOG_FILE"
+    printf 'BACKUP_REPORT_CONFIG=%q\n' "$BACKUP_REPORT_CONFIG"
+    printf 'BACKUP_STARTED_AT=%q\n' "$BACKUP_STARTED_AT"
     printf 'OVERDUE_APPS=('
     for APP in "${OVERDUE_APPS[@]}"; do
         printf ' %q' "$APP"
@@ -684,6 +688,51 @@ NC='\033[0m'
 
 exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
 echo -e "${CYAN}Appending backup-runner output to: ${SCRIPT_LOG_FILE}${NC}"
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+report_backup_result() {
+    local server_ip hostname completed_at items="" item_sep="" app rc app_status last payload
+
+    [[ -r "$BACKUP_REPORT_CONFIG" ]] || return 0
+    # This root-owned file supplies BACKUP_REPORT_URL, BACKUP_REPORT_TOKEN, and
+    # optionally BACKUP_SERVER_IP. The token is never written into this runner.
+    # shellcheck disable=SC1090
+    source "$BACKUP_REPORT_CONFIG"
+    if [[ -z "${BACKUP_REPORT_URL:-}" || -z "${BACKUP_REPORT_TOKEN:-}" ]]; then
+        echo -e "${YELLOW}Backup reporting skipped: incomplete ${BACKUP_REPORT_CONFIG}.${NC}"
+        return 0
+    fi
+
+    server_ip="${BACKUP_SERVER_IP:-}"
+    if [[ -z "$server_ip" ]]; then
+        server_ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+    fi
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    completed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    for i in "${!RESULT_APPS[@]}"; do
+        app="${RESULT_APPS[$i]}"
+        rc="${RESULT_RC[$i]}"
+        [[ "$rc" -eq 0 ]] && app_status="COMPLETED" || app_status="FAILED"
+        last=$(fact_val "last_backup_${app}")
+        item_sep="${items:+,}"
+        items+="${item_sep}{\"app\":\"$(json_escape "$app")\",\"status\":\"${app_status}\",\"latestBackup\":\"$(json_escape "${last:-n/a}")\"}"
+    done
+    payload="{\"serverIp\":\"$(json_escape "$server_ip")\",\"hostname\":\"$(json_escape "$hostname")\",\"status\":\"$([[ "$FAIL" -eq 0 ]] && echo COMPLETED || echo FAILED)\",\"startedAt\":\"${BACKUP_STARTED_AT}\",\"completedAt\":\"${completed_at}\",\"apps\":[${items}]}"
+
+    if curl -fsS --connect-timeout 10 --max-time 30 \
+        -X POST "$BACKUP_REPORT_URL" \
+        -H "Authorization: Bearer ${BACKUP_REPORT_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "$payload" >/dev/null; then
+        echo -e "${GREEN}Backup result sent to the central dashboard.${NC}"
+    else
+        echo -e "${YELLOW}Backup reporting failed; the local backup result is still in ${SCRIPT_LOG_FILE}.${NC}"
+    fi
+}
 
 to_readable() {
     awk -v b="${1:-0}" 'BEGIN{
@@ -893,6 +942,7 @@ if [[ "$FAIL" -eq 0 ]]; then
 else
     echo -e "${RED}${BOLD}One or more backups failed — see red lines above${NC}"
 fi
+report_backup_result
 echo -e "${BOLD}Runner finished $(date '+%Y-%m-%d %H:%M:%S')  fail=${FAIL}${NC}"
 echo -e "${BOLD}==================================================${NC}"
 echo "This window stays open. Detach: Ctrl+A then D"
