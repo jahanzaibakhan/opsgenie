@@ -99,6 +99,13 @@ setup_runtime_reporting() {
         source "$BACKUP_REPORT_CONFIG"
         return 0
     fi
+    if [[ -n "${BACKUP_REPORT_TOKEN:-}" ]]; then
+        BACKUP_REPORT_URL="${BACKUP_REPORT_URL:-${BACKUP_REPORT_URL_DEFAULT}/reports}"
+        BACKUP_SERVER_IP="${BACKUP_SERVER_IP:-$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')}"
+        export BACKUP_REPORT_URL BACKUP_REPORT_TOKEN BACKUP_SERVER_IP
+        echo -e "${GREEN}Dashboard reporting enabled with the supplied runtime token.${NC}"
+        return 0
+    fi
     echo
     read -rp "Optional: paste one-time backup dashboard setup code (Enter to skip reporting): " code <"$TTY"
     [[ -n "$code" ]] || return 0
