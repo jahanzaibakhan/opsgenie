@@ -26,7 +26,10 @@ LOG_FILE="/var/log/backup.log"
 BACKUP_SCRIPT="/var/cw/scripts/bash/duplicity_backup.sh"
 APPS_PATH="/home/master/applications"
 DUPLICITY_CACHE="/home/.duplicity"
-BACKUP_TEMP_DIR="${BACKUP_TEMP_DIR:-/tmp}"
+# Cloudways stores per-app backup dumps alongside application files, commonly
+# on /mnt/data. BACKUP_WORK_DIR can override this for custom installations;
+# BACKUP_TEMP_DIR remains supported for existing callers.
+BACKUP_WORK_DIR="${BACKUP_WORK_DIR:-${BACKUP_TEMP_DIR:-$APPS_PATH}}"
 SCREEN_NAME="back"
 RUNNER="/tmp/opsgenie-backup-runner.sh"
 SCRIPT_LOG_DIR="/var/cw/systeam/backup-log"
@@ -35,7 +38,7 @@ BACKUP_REPORT_CONFIG="/etc/backup-reporting.env"
 BACKUP_REPORT_URL_DEFAULT="https://backups.jhanzaib.online/api"
 CPU_THRESHOLD=70
 SWAP_THRESHOLD=50
-SPACE_MULTIPLIER_PERCENT=120
+SPACE_MULTIPLIER_PERCENT=110
 
 ERROR_APPS=()
 ELIGIBLE_APPS=()
@@ -217,38 +220,35 @@ required_space_bytes() {
 capacity_check_app() {
     local app="$1"
     local required="${2:-0}"
-    local label path info filesystem available mount
-    local -A seen_mounts=()
-    local failed=0
+    local work_dir="$BACKUP_WORK_DIR"
+    local info filesystem available mount
 
     [[ "$required" -gt 0 ]] || return 0
+    # If the configured work directory is the application root, use the
+    # app's own directory. This follows Cloudways' applications symlink to
+    # the real files mount (such as /mnt/data).
+    [[ "$work_dir" == "$APPS_PATH" ]] && work_dir="$APPS_PATH/$app"
     log_section "Capacity check: ${app}"
     log_line "Database size: $(to_readable "$(( required * 100 / SPACE_MULTIPLIER_PERCENT ))")"
-    log_line "Required free space: $(to_readable "$required")"
-    for label in "Database:/var/lib/mysql/$app" "Application:$APPS_PATH/$app" "Temporary:$BACKUP_TEMP_DIR" "Duplicity cache:$DUPLICITY_CACHE"; do
-        path="${label#*:}"
-        info=$(mount_info "$path")
-        if [[ -z "$info" ]]; then
-            echo -e "${RED}  ${label}: unable to determine filesystem capacity${NC}"
-            log_line "FAIL ${label}: unable to determine filesystem capacity"
-            DISK_PRESSURE_DETAILS+=("${app} ${label}: filesystem capacity could not be determined")
-            failed=1
-            continue
-        fi
-        IFS=$'\t' read -r filesystem available mount <<< "$info"
-        [[ -n "${seen_mounts[$filesystem:$mount]:-}" ]] && continue
-        seen_mounts["$filesystem:$mount"]=1
-        if (( available >= required )); then
-            echo -e "${GREEN}  PASS ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
-            log_line "PASS ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")"
-        else
-            echo -e "${RED}  FAIL ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
-            log_line "FAIL ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")"
-            DISK_PRESSURE_DETAILS+=("${app} ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")")
-            failed=1
-        fi
-    done
-    return "$failed"
+    log_line "Required free space on backup work mount: $(to_readable "$required")"
+    info=$(mount_info "$work_dir")
+    if [[ -z "$info" ]]; then
+        echo -e "${RED}  Backup work directory ${work_dir}: unable to determine filesystem capacity${NC}"
+        log_line "FAIL Backup work directory ${work_dir}: filesystem capacity could not be determined"
+        DISK_PRESSURE_DETAILS+=("${app} backup work directory ${work_dir}: filesystem capacity could not be determined")
+        return 1
+    fi
+    IFS=$'\t' read -r filesystem available mount <<< "$info"
+    if (( available >= required )); then
+        echo -e "${GREEN}  PASS Backup work mount (${mount}, ${work_dir}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+        log_line "PASS Backup work mount (${mount}, ${work_dir}): free $(to_readable "$available"), need $(to_readable "$required")"
+        return 0
+    fi
+
+    echo -e "${RED}  FAIL Backup work mount (${mount}, ${work_dir}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+    log_line "FAIL Backup work mount (${mount}, ${work_dir}): free $(to_readable "$available"), need $(to_readable "$required")"
+    DISK_PRESSURE_DETAILS+=("${app} backup work mount ${mount} (${work_dir}): free $(to_readable "$available"), need $(to_readable "$required")")
+    return 1
 }
 
 to_bytes() {
@@ -559,7 +559,7 @@ fi
 SPACE_SKIPPED_APPS=()
 if [[ ${#ELIGIBLE_APPS[@]} -gt 0 ]]; then
     echo
-    echo -e "${BOLD}▶ Step 6b: Per-app backup capacity check (120% of database size)${NC}"
+    echo -e "${BOLD}▶ Step 6b: Per-app backup capacity check (${SPACE_MULTIPLIER_PERCENT}% of database size on the dump work mount)${NC}"
     CAPACITY_ELIGIBLE_APPS=()
     for APP in "${ELIGIBLE_APPS[@]}"; do
         DB_BYTES="${APP_DB_BYTES[$APP]:-0}"
@@ -726,7 +726,7 @@ fi
     printf 'SCREEN_NAME=%q\n' "$SCREEN_NAME"
     printf 'APPS_PATH=%q\n' "$APPS_PATH"
     printf 'DUPLICITY_CACHE=%q\n' "$DUPLICITY_CACHE"
-    printf 'BACKUP_TEMP_DIR=%q\n' "$BACKUP_TEMP_DIR"
+    printf 'BACKUP_WORK_DIR=%q\n' "$BACKUP_WORK_DIR"
     printf 'SPACE_MULTIPLIER_PERCENT=%q\n' "$SPACE_MULTIPLIER_PERCENT"
     printf 'SCRIPT_LOG_FILE=%q\n' "$SCRIPT_LOG_FILE"
     printf 'BACKUP_REPORT_CONFIG=%q\n' "$BACKUP_REPORT_CONFIG"
@@ -819,34 +819,27 @@ to_readable() {
 }
 
 capacity_check_app() {
-    local app="$1" db_bytes required label path info filesystem available mount
-    local -A seen_mounts=()
-    local failed=0
+ local app="$1" db_bytes required work_dir info filesystem available mount
     db_bytes=$(sudo du -sxB1 "/var/lib/mysql/$app" 2>/dev/null | awk '{print $1}')
     db_bytes=${db_bytes:-0}
     required=$(( db_bytes * SPACE_MULTIPLIER_PERCENT / 100 ))
     [[ "$required" -gt 0 ]] || return 0
+ work_dir="$BACKUP_WORK_DIR"
+ [[ "$work_dir" == "$APPS_PATH" ]] && work_dir="$APPS_PATH/$app"
 
-    echo -e "${CYAN}Capacity re-check for ${app}: DB $(to_readable "$db_bytes"), need $(to_readable "$required") free${NC}"
-    for label in "Database:/var/lib/mysql/$app" "Application:$APPS_PATH/$app" "Temporary:$BACKUP_TEMP_DIR" "Duplicity cache:$DUPLICITY_CACHE"; do
-        path="${label#*:}"
-        info=$(df -PB1 "$path" 2>/dev/null | awk 'NR==2 {print $1 "\t" $4 "\t" $6}')
-        if [[ -z "$info" ]]; then
-            echo -e "${RED}  FAIL ${label}: cannot determine filesystem capacity${NC}"
-            failed=1
-            continue
-        fi
-        IFS=$'\t' read -r filesystem available mount <<< "$info"
-        [[ -n "${seen_mounts[$filesystem:$mount]:-}" ]] && continue
-        seen_mounts["$filesystem:$mount"]=1
-        if (( available >= required )); then
-            echo -e "${GREEN}  PASS ${label} (${mount}): free $(to_readable "$available")${NC}"
-        else
-            echo -e "${RED}  FAIL ${label} (${mount}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
-            failed=1
-        fi
-    done
-    return "$failed"
+ echo -e "${CYAN}Capacity re-check for ${app}: DB $(to_readable "$db_bytes"), need $(to_readable "$required") on the dump work mount${NC}"
+ info=$(df -PB1 "$work_dir" 2>/dev/null | awk 'NR==2 {print $1 "\t" $4 "\t" $6}')
+ if [[ -z "$info" ]]; then
+ echo -e "${RED}  FAIL Backup work directory ${work_dir}: cannot determine filesystem capacity${NC}"
+ return 1
+ fi
+ IFS=$'\t' read -r filesystem available mount <<< "$info"
+ if (( available >= required )); then
+ echo -e "${GREEN}  PASS Backup work mount (${mount}, ${work_dir}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+ return 0
+ fi
+ echo -e "${RED}  FAIL Backup work mount (${mount}, ${work_dir}): free $(to_readable "$available"), need $(to_readable "$required")${NC}"
+ return 1
 }
 
 fact_val() {
