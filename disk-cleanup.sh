@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Safely reclaim disk space from duplicity cache and oversized log files.
-# Run with: curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash
+# Fast default: curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash
+# Full audit:   curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash -s -- --full-scan
 
 set -u
 set -o pipefail
@@ -9,9 +10,38 @@ set -o pipefail
 readonly DUPLICITY_CACHE="/home/.duplicity"
 readonly APP_ROOT="/home/master/applications"
 readonly LOG_LIMIT_BYTES=$((100 * 1024 * 1024))
+FULL_SCAN=false
 declare -a CLEANED_ITEMS=()
 declare -a FAILED_ITEMS=()
 declare -i EXPECTED_RECLAIMED_BYTES=0
+
+usage() {
+    cat <<'EOF'
+Usage: disk-cleanup.sh [--full-scan]
+
+Without arguments, the script uses fast mode. It clears the duplicity cache,
+checks /var/log and application log directories for oversized logs, and reports
+disk space before and after cleanup.
+
+--full-scan  Include recursive top-directory and application-size reports, and
+             search the entire root filesystem for eligible oversized log files.
+EOF
+}
+
+parse_arguments() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --full-scan) FULL_SCAN=true ;;
+            -h|--help) usage; exit 0 ;;
+            *)
+                error "ERROR: Unknown option: $1"
+                usage >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     readonly C_RESET=$'\033[0m'
@@ -215,11 +245,30 @@ clean_duplicity_cache() {
 
 truncate_large_logs() {
     section "Log files larger than 100 MiB"
-    local file apparent_bytes bytes
+    local file apparent_bytes bytes scan_label
     local count=0
+    local -a scan_roots=()
 
-    # Search the current filesystem only. This avoids traversing mounted backups,
-    # network shares, /proc, /sys, and other virtual filesystems.
+    if [[ "$FULL_SCAN" == true ]]; then
+        scan_label="Full filesystem scan (current filesystem only)"
+        scan_roots=(/)
+    else
+        # Avoid a recursive walk of every application. Application log
+        # directories are checked directly, which keeps the default path fast.
+        scan_label="Fast scan: /var/log and application log directories"
+        scan_roots=(/var/log)
+        if [[ -d "$APP_ROOT" ]]; then
+            for app_dir in "$APP_ROOT"/*; do
+                [[ -d "$app_dir" ]] || continue
+                [[ -d "$app_dir/logs" ]] && scan_roots+=("$app_dir/logs")
+                [[ -d "$app_dir/log" ]] && scan_roots+=("$app_dir/log")
+            done
+        fi
+    fi
+
+    echo "$scan_label"
+    # -xdev prevents mounted backups, network shares, /proc, /sys, and other
+    # virtual filesystems from being traversed.
     while IFS= read -r -d '' file; do
         is_log_file "$file" || continue
         apparent_bytes=$(sudo stat -c '%s' -- "$file" 2>/dev/null || echo 0)
@@ -235,12 +284,14 @@ truncate_large_logs() {
             FAILED_ITEMS+=("$file")
             error "ERROR: Could not truncate: $file"
         fi
-    done < <(sudo find / -xdev -type f -size +100M -print0 2>/dev/null)
+    done < <(sudo find "${scan_roots[@]}" -xdev -type f -size +100M -print0 2>/dev/null)
 
     (( count > 0 )) || warning "• No qualifying log files found."
 }
 
 main() {
+    parse_arguments "$@"
+
     if ! command -v sudo >/dev/null 2>&1; then
         error "ERROR: sudo is required."
         exit 1
@@ -249,6 +300,11 @@ main() {
     section "Disk cleanup started: $(date '+%Y-%m-%d %H:%M:%S %Z')"
     warning "This script clears only the contents of $DUPLICITY_CACHE and truncates log files over 100 MiB."
     warning "It does not remove any of the reported top directories."
+    if [[ "$FULL_SCAN" == true ]]; then
+        warning "Full-scan mode is enabled; recursive disk and application scans may take time."
+    else
+        success "Fast mode is enabled; use --full-scan for recursive directory and application size reports."
+    fi
     echo
     warning "Sudo access is required; you may be prompted for your password."
     sudo -v
@@ -257,8 +313,10 @@ main() {
     free_before=$(free_space_bytes || echo 0)
     section "Disk usage before cleanup"
     show_disk_usage
-    show_top_directories "Top 5 largest root-level directories before cleanup"
-    show_top_applications "Top 5 largest application directories before cleanup"
+    if [[ "$FULL_SCAN" == true ]]; then
+        show_top_directories "Top 5 largest root-level directories before cleanup"
+        show_top_applications "Top 5 largest application directories before cleanup"
+    fi
 
     clean_duplicity_cache
     truncate_large_logs
@@ -280,8 +338,10 @@ main() {
     free_after=$(free_space_bytes || echo 0)
     show_reclaimed_space "$free_before" "$free_after"
     show_cleanup_reconciliation "$free_before" "$free_after"
-    show_top_directories "Top 5 largest root-level directories after cleanup"
-    show_top_applications "Top 5 largest application directories after cleanup"
+    if [[ "$FULL_SCAN" == true ]]; then
+        show_top_directories "Top 5 largest root-level directories after cleanup"
+        show_top_applications "Top 5 largest application directories after cleanup"
+    fi
 
     section "Disk cleanup completed"
 }
