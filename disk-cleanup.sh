@@ -106,19 +106,38 @@ free_space_bytes() {
     df -PB1 / 2>/dev/null | awk 'NR == 2 { print $4 }'
 }
 
-show_reclaimed_space() {
-    local before="$1"
-    local after="$2"
-    local reclaimed=$((after - before))
+physical_free_space_bytes() {
+    # df's Available column excludes filesystem blocks reserved for root.
+    # Size - Used reflects all currently unallocated blocks on the filesystem.
+    df -PB1 / 2>/dev/null | awk 'NR == 2 { print $2 - $3 }'
+}
 
-    if (( reclaimed > 0 )); then
-        success "✓ Disk space reclaimed on /: $(human_size "$reclaimed")"
-    elif (( reclaimed == 0 )); then
-        warning "• Free space on / did not change."
+show_reclaimed_space() {
+    local available_before="$1"
+    local available_after="$2"
+    local physical_before="$3"
+    local physical_after="$4"
+    local available_reclaimed=$((available_after - available_before))
+    local physical_reclaimed=$((physical_after - physical_before))
+    local root_reserved=$((physical_after - available_after))
+
+    if (( physical_reclaimed > 0 )); then
+        success "✓ Physical disk space reclaimed on /: $(human_size "$physical_reclaimed")"
+    elif (( physical_reclaimed == 0 )); then
+        warning "• Physical free space on / did not change."
     else
-        warning "• Free space on / decreased by $(human_size "$((before - after))") while the script ran."
+        warning "• Physical free space on / decreased by $(human_size "$((physical_before - physical_after))") while the script ran."
     fi
-    success "✓ Free space available on /: $(human_size "$after")"
+
+    success "✓ Physical free space on /: $(human_size "$physical_after")"
+    success "✓ Free space available to non-root users on /: $(human_size "$available_after")"
+
+    if (( root_reserved > 0 )); then
+        warning "• $(human_size "$root_reserved") is reserved or otherwise unavailable to non-root users on this filesystem."
+        if (( available_reclaimed >= 0 && physical_reclaimed > available_reclaimed )); then
+            warning "• The difference between reclaimed and user-available space is due to that reservation."
+        fi
+    fi
 }
 
 show_deleted_open_files() {
@@ -157,16 +176,16 @@ show_deleted_open_files() {
 }
 
 show_cleanup_reconciliation() {
-    local before="$1"
-    local after="$2"
-    local observed=$((after - before))
+    local physical_before="$1"
+    local physical_after="$2"
+    local observed=$((physical_after - physical_before))
 
     section "Cleanup space reconciliation"
     echo "Allocated blocks cleared: $(human_size "$EXPECTED_RECLAIMED_BYTES")"
-    echo "Observed free-space increase: $(human_size "$(( observed > 0 ? observed : 0 ))")"
+    echo "Observed physical free-space increase: $(human_size "$(( observed > 0 ? observed : 0 ))")"
 
     if (( observed + (16 * 1024 * 1024) < EXPECTED_RECLAIMED_BYTES )); then
-        warning "• The free-space increase is lower than the allocated blocks cleared."
+        warning "• The physical free-space increase is lower than the allocated blocks cleared."
         warning "• A process may still hold deleted files open, or active writes may have consumed space during cleanup."
         show_deleted_open_files
     fi
@@ -309,8 +328,9 @@ main() {
     warning "Sudo access is required; you may be prompted for your password."
     sudo -v
 
-    local free_before free_after
+    local free_before free_after physical_free_before physical_free_after
     free_before=$(free_space_bytes || echo 0)
+    physical_free_before=$(physical_free_space_bytes || echo 0)
     section "Disk usage before cleanup"
     show_disk_usage
     if [[ "$FULL_SCAN" == true ]]; then
@@ -336,8 +356,9 @@ main() {
     section "Disk usage after cleanup"
     show_disk_usage
     free_after=$(free_space_bytes || echo 0)
-    show_reclaimed_space "$free_before" "$free_after"
-    show_cleanup_reconciliation "$free_before" "$free_after"
+    physical_free_after=$(physical_free_space_bytes || echo 0)
+    show_reclaimed_space "$free_before" "$free_after" "$physical_free_before" "$physical_free_after"
+    show_cleanup_reconciliation "$physical_free_before" "$physical_free_after"
     if [[ "$FULL_SCAN" == true ]]; then
         show_top_directories "Top 5 largest root-level directories after cleanup"
         show_top_applications "Top 5 largest application directories after cleanup"
