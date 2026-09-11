@@ -20,8 +20,8 @@ usage() {
 Usage: disk-cleanup.sh [--full-scan]
 
 Without arguments, the script uses fast mode. It clears the duplicity cache,
-checks /var/log and application log directories for oversized logs, and reports
-disk space before and after cleanup.
+checks /var/log, application log directories, and PM2 log directories for
+oversized logs, and reports disk space before and after cleanup.
 
 --full-scan  Include recursive top-directory and application-size reports, and
              search the entire root filesystem for eligible oversized log files.
@@ -272,9 +272,9 @@ truncate_large_logs() {
         scan_label="Full filesystem scan (current filesystem only)"
         scan_roots=(/)
     else
-        # Avoid a recursive walk of every application. Application log
-        # directories are checked directly, which keeps the default path fast.
-        scan_label="Fast scan: /var/log and application log directories"
+        # Avoid a recursive walk of every application. Known log directories
+        # are checked directly, which keeps the default path fast.
+        scan_label="Fast scan: /var/log, application log directories, and PM2 logs"
         scan_roots=(/var/log)
         if [[ -d "$APP_ROOT" ]]; then
             for app_dir in "$APP_ROOT"/*; do
@@ -283,6 +283,12 @@ truncate_large_logs() {
                 [[ -d "$app_dir/log" ]] && scan_roots+=("$app_dir/log")
             done
         fi
+        # PM2 stores logs outside app directories, typically under the
+        # account home. Glob expansion reads only home-directory entries and
+        # does not recursively scan application data.
+        for pm2_logs in /home/*/.pm2/logs /root/.pm2/logs; do
+            [[ -d "$pm2_logs" ]] && scan_roots+=("$pm2_logs")
+        done
     fi
 
     echo "$scan_label"
