@@ -599,34 +599,71 @@ def sql_fingerprint(query: str, max_len: int = 140) -> str:
     return q[:max_len]
 
 
-def scan_php_slow_logs(pattern: str, time_start: datetime | None, time_end: datetime | None):
-    """Parse PHP-FPM slow logs into per-pool slow request events."""
+def parse_php_slow_file(fp, default_pool: str, time_start: datetime | None, time_end: datetime | None):
+    """Parse one PHP-FPM slow log file into slow request events."""
     events = []
-    files = files_touching_window(sorted(glob.glob(pattern)), time_start)
-    for fp in files:
-        current = None
-        for line in iter_log_lines(Path(fp)):
-            m = PHP_SLOW_HEADER_RE.match(line)
-            if m:
-                day, mon, year, hh, mi, ss, pool = m.groups()
-                month = MONTH_NUM.get(mon.capitalize())
+    current = None
+    for line in iter_log_lines(Path(fp)):
+        m = PHP_SLOW_HEADER_RE.match(line)
+        if m:
+            day, mon, year, hh, mi, ss, _pool = m.groups()
+            month = MONTH_NUM.get(mon.capitalize())
+            current = None
+            if month:
+                try:
+                    dt = datetime(int(year), month, int(day), int(hh), int(mi), int(ss))
+                except ValueError:
+                    continue
+                if in_time_window(dt, time_start, time_end):
+                    # The file location (app directory) is more reliable than
+                    # the pool name in the header; fall back to the header pool
+                    # for server-wide log locations.
+                    current = {"dt": dt, "pool": default_pool or _pool.strip() or "unknown", "script": ""}
+                    events.append(current)
+            continue
+        if current is not None:
+            m_script = PHP_SLOW_SCRIPT_RE.match(line.strip())
+            if m_script:
+                current["script"] = m_script.group(1).strip()
                 current = None
-                if month:
-                    try:
-                        dt = datetime(int(year), month, int(day), int(hh), int(mi), int(ss))
-                    except ValueError:
-                        continue
-                    if in_time_window(dt, time_start, time_end):
-                        current = {"dt": dt, "pool": pool.strip(), "script": ""}
-                        events.append(current)
+    return events
+
+
+def scan_php_slow_logs_for_apps(
+    app_rows: list[dict],
+    rel_glob: str,
+    time_start: datetime | None,
+    time_end: datetime | None,
+):
+    """Scan per-app PHP slow logs, but only for the given (high-traffic) apps.
+
+    Cloudways stores PHP slow logs inside each application directory
+    (e.g. /home/master/applications/<app>/logs/php-app.slow.log). Scanning only
+    the top-traffic apps keeps this fast on servers with many applications.
+    An absolute glob is also supported for server-wide slow log locations.
+    """
+    events = []
+    files_scanned = []
+    if rel_glob.startswith("/"):
+        files = files_touching_window(sorted(glob.glob(rel_glob)), time_start)
+        for fp in files:
+            files_scanned.append(fp)
+            # Without an owning app directory, keep the pool name from the header.
+            events.extend(parse_php_slow_file(fp, "", time_start, time_end))
+    else:
+        for row in app_rows:
+            app = row["app"]
+            app_dir = Path(row["app_dir"])
+            try:
+                candidates = sorted(str(p) for p in app_dir.glob(rel_glob))
+            except OSError:
                 continue
-            if current is not None:
-                m_script = PHP_SLOW_SCRIPT_RE.match(line.strip())
-                if m_script:
-                    current["script"] = m_script.group(1).strip()
-                    current = None
+            files = files_touching_window(candidates, time_start)
+            for fp in files:
+                files_scanned.append(fp)
+                events.extend(parse_php_slow_file(fp, app, time_start, time_end))
     events.sort(key=lambda e: e["dt"])
-    return events, files
+    return events, files_scanned
 
 
 def analyze_php_slow(events, log_files):
@@ -2132,8 +2169,11 @@ def main():
     )
     parser.add_argument(
         "--php-slow-glob",
-        default="/var/log/php*slow*log*",
-        help="Glob for PHP-FPM slow logs (default: /var/log/php*slow*log*)",
+        default="logs/*slow*log*",
+        help=(
+            "Glob for PHP slow logs, relative to each top-traffic application directory "
+            "(default: logs/*slow*log*). An absolute path scans server-wide instead."
+        ),
     )
     parser.add_argument(
         "--mysql-slow-glob",
@@ -2396,8 +2436,15 @@ def main():
         if args.days is not None and time_start is None and time_end is None:
             slow_time_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=args.days)
 
-        progress_log(progress, f"Scanning PHP-FPM slow logs ({args.php_slow_glob})")
-        php_slow_events, php_slow_files = scan_php_slow_logs(args.php_slow_glob, slow_time_start, slow_time_end)
+        # Only the top-traffic apps (the likely culprits) are scanned, which
+        # keeps this fast on servers with many applications.
+        progress_log(
+            progress,
+            f"Scanning PHP slow logs for top {len(top5)} apps (glob: {args.php_slow_glob})",
+        )
+        php_slow_events, php_slow_files = scan_php_slow_logs_for_apps(
+            top5, args.php_slow_glob, slow_time_start, slow_time_end
+        )
         php_slow_analysis = analyze_php_slow(php_slow_events, php_slow_files)
         progress_log(
             progress,
