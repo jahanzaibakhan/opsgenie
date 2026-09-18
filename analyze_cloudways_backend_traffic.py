@@ -154,12 +154,20 @@ def colorize_terminal_report(report: str, request_threshold: int, enabled: bool)
             line == "Cloudways Backend Access Traffic Summary"
             or line == "Top 5 applications by total traffic"
             or line == "All applications by traffic"
+            or line == "Investigation Summary & Recommended Actions"
             or line.startswith("Application: ")
+            or line.startswith("App: ")
             or line.startswith("FPM max_children Breaches")
             or line.startswith("WP-Cron ")
             or line.startswith("OOM ")
+            or line.startswith("Slow PHP Requests")
+            or line.startswith("Slow MySQL Queries")
         ):
             colored.append(f"{ANSI_CYAN}{ANSI_BOLD}{line}{ANSI_RESET}")
+        elif "LIKELY BOT FLOOD" in line or "CRITICAL:" in line or "CULPRIT" in line:
+            colored.append(f"{ANSI_RED}{ANSI_BOLD}{line}{ANSI_RESET}")
+        elif line.strip().startswith("Verdict:") or "WARNING:" in line or "SLOW PHP:" in line or "SLOW MYSQL:" in line:
+            colored.append(f"{ANSI_YELLOW}{ANSI_BOLD}{line}{ANSI_RESET}")
         elif line.startswith("Total Requests:") or line.startswith("Error Count"):
             colored.append(f"{ANSI_YELLOW}{line}{ANSI_RESET}")
         elif line.startswith("="):
@@ -560,6 +568,195 @@ def analyze_oom_events(events, log_files):
         "timestamps": [e["dt"].strftime(EVENT_TS_FMT) for e in events][:100],
         "cluster_gap_seconds": OOM_CLUSTER_GAP_SECONDS,
         "clusters": clusters,
+    }
+
+
+# --- Slow PHP / slow MySQL analysis ---------------------------------------------
+
+# PHP-FPM slow log header: "[18-Sep-2026 10:15:30]  [pool abcdefghij] pid 12345"
+PHP_SLOW_HEADER_RE = re.compile(
+    r"^\[(\d{2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})\]\s+\[pool ([^\]]+)\]"
+)
+PHP_SLOW_SCRIPT_RE = re.compile(r"^script_filename\s*=\s*(.+)$")
+
+# MySQL slow log metadata lines.
+MYSQL_SLOW_TIME_ISO_RE = re.compile(r"^# Time:\s+(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+MYSQL_SLOW_TIME_CLASSIC_RE = re.compile(r"^# Time:\s+(\d{2})(\d{2})(\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})")
+MYSQL_SLOW_USERHOST_RE = re.compile(r"^# User@Host:\s*(\S+?)\[")
+MYSQL_SLOW_QUERYTIME_RE = re.compile(
+    r"^# Query_time:\s*([\d.]+)\s+Lock_time:\s*([\d.]+)\s+Rows_sent:\s*(\d+)\s+Rows_examined:\s*(\d+)"
+)
+MYSQL_SLOW_USE_RE = re.compile(r"^use\s+`?([A-Za-z0-9_]+)`?\s*;?\s*$", re.IGNORECASE)
+SQL_NUMBER_RE = re.compile(r"\b\d+\b")
+SQL_STRING_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def sql_fingerprint(query: str, max_len: int = 140) -> str:
+    """Collapse literals so similar queries aggregate under one fingerprint."""
+    q = " ".join(query.split())
+    q = SQL_STRING_RE.sub("'?'", q)
+    q = SQL_NUMBER_RE.sub("?", q)
+    return q[:max_len]
+
+
+def scan_php_slow_logs(pattern: str, time_start: datetime | None, time_end: datetime | None):
+    """Parse PHP-FPM slow logs into per-pool slow request events."""
+    events = []
+    files = files_touching_window(sorted(glob.glob(pattern)), time_start)
+    for fp in files:
+        current = None
+        for line in iter_log_lines(Path(fp)):
+            m = PHP_SLOW_HEADER_RE.match(line)
+            if m:
+                day, mon, year, hh, mi, ss, pool = m.groups()
+                month = MONTH_NUM.get(mon.capitalize())
+                current = None
+                if month:
+                    try:
+                        dt = datetime(int(year), month, int(day), int(hh), int(mi), int(ss))
+                    except ValueError:
+                        continue
+                    if in_time_window(dt, time_start, time_end):
+                        current = {"dt": dt, "pool": pool.strip(), "script": ""}
+                        events.append(current)
+                continue
+            if current is not None:
+                m_script = PHP_SLOW_SCRIPT_RE.match(line.strip())
+                if m_script:
+                    current["script"] = m_script.group(1).strip()
+                    current = None
+    events.sort(key=lambda e: e["dt"])
+    return events, files
+
+
+def analyze_php_slow(events, log_files):
+    per_pool = Counter(e["pool"] for e in events)
+    per_script = Counter(e["script"] for e in events if e["script"])
+    return {
+        "log_files_scanned": log_files,
+        "total_slow_requests": len(events),
+        "per_pool": per_pool.most_common(),
+        "top_scripts": per_script.most_common(10),
+        "first_event": events[0]["dt"].strftime(EVENT_TS_FMT) if events else "",
+        "last_event": events[-1]["dt"].strftime(EVENT_TS_FMT) if events else "",
+    }
+
+
+def scan_mysql_slow_log(pattern: str, time_start: datetime | None, time_end: datetime | None):
+    """Parse MySQL slow-query logs into per-database slow query events."""
+    events = []
+    files = files_touching_window(sorted(glob.glob(pattern)), time_start)
+    for fp in files:
+        current_dt = None
+        current_db = ""
+        pending = None  # metadata waiting for its SQL text
+        sql_parts = []
+
+        def flush():
+            nonlocal pending, sql_parts
+            if pending is not None:
+                query = " ".join(sql_parts).strip()
+                if query:
+                    pending["fingerprint"] = sql_fingerprint(query)
+                    events.append(pending)
+            pending = None
+            sql_parts = []
+
+        for line in iter_log_lines(Path(fp)):
+            m = MYSQL_SLOW_TIME_ISO_RE.match(line)
+            if m:
+                flush()
+                y, mo, d, hh, mi, ss = (int(x) for x in m.groups())
+                try:
+                    current_dt = datetime(y, mo, d, hh, mi, ss)
+                except ValueError:
+                    current_dt = None
+                continue
+            m = MYSQL_SLOW_TIME_CLASSIC_RE.match(line)
+            if m:
+                flush()
+                yy, mo, d, hh, mi, ss = (int(x) for x in m.groups())
+                try:
+                    current_dt = datetime(2000 + yy, mo, d, hh, mi, ss)
+                except ValueError:
+                    current_dt = None
+                continue
+            m = MYSQL_SLOW_USERHOST_RE.match(line)
+            if m:
+                flush()
+                # On Cloudways the MySQL user typically matches the database name.
+                current_db = m.group(1)
+                continue
+            m = MYSQL_SLOW_QUERYTIME_RE.match(line)
+            if m:
+                flush()
+                if not in_time_window(current_dt, time_start, time_end):
+                    pending = None
+                    continue
+                qt, lock, sent, examined = m.groups()
+                pending = {
+                    "dt": current_dt,
+                    "db": current_db,
+                    "query_time": float(qt),
+                    "lock_time": float(lock),
+                    "rows_sent": int(sent),
+                    "rows_examined": int(examined),
+                    "fingerprint": "",
+                }
+                continue
+            if line.startswith("#") or line.startswith("SET timestamp="):
+                continue
+            m = MYSQL_SLOW_USE_RE.match(line)
+            if m:
+                current_db = m.group(1)
+                if pending is not None:
+                    pending["db"] = current_db
+                continue
+            if pending is not None and line.strip():
+                sql_parts.append(line.strip())
+        flush()
+    events.sort(key=lambda e: (e["dt"] is None, e["dt"]))
+    return events, files
+
+
+def analyze_mysql_slow(events, log_files):
+    per_db_count = Counter()
+    per_db_time = defaultdict(float)
+    per_fingerprint = defaultdict(lambda: {"count": 0, "total_time": 0.0, "max_time": 0.0, "db": ""})
+    max_query_time = 0.0
+    for e in events:
+        db = e["db"] or "unknown"
+        per_db_count[db] += 1
+        per_db_time[db] += e["query_time"]
+        max_query_time = max(max_query_time, e["query_time"])
+        fp = per_fingerprint[e["fingerprint"] or "(query text unavailable)"]
+        fp["count"] += 1
+        fp["total_time"] += e["query_time"]
+        fp["max_time"] = max(fp["max_time"], e["query_time"])
+        fp["db"] = db
+    top_queries = sorted(
+        (
+            {
+                "fingerprint": fingerprint,
+                "db": data["db"],
+                "count": data["count"],
+                "total_time_seconds": round(data["total_time"], 2),
+                "max_time_seconds": round(data["max_time"], 2),
+            }
+            for fingerprint, data in per_fingerprint.items()
+        ),
+        key=lambda x: x["total_time_seconds"],
+        reverse=True,
+    )[:10]
+    return {
+        "log_files_scanned": log_files,
+        "total_slow_queries": len(events),
+        "max_query_time_seconds": round(max_query_time, 2),
+        "per_database": [
+            {"db": db, "count": cnt, "total_time_seconds": round(per_db_time[db], 2)}
+            for db, cnt in per_db_count.most_common()
+        ],
+        "top_queries": top_queries,
     }
 
 
@@ -1130,6 +1327,45 @@ def summarize_app(
         for subnet, cnt in subnet_hits.most_common(10)
     ]
 
+    # Individual culprit IPs (subnets alone can hide a single abusive host).
+    top_ips = [
+        {
+            "ip": ip,
+            "requests": cnt,
+            "percent_of_total": round(cnt * 100.0 / total, 1) if total else 0.0,
+            "country": country_label(geo.lookup(ip)),
+        }
+        for ip, cnt in ip_hits.most_common(10)
+    ]
+
+    # Traffic pattern: compare the busiest minute against the average minute to
+    # distinguish a short burst from a sustained flood.
+    peak_hour_key, peak_minute, peak_count = "", -1, 0
+    active_minutes = 0
+    for hour_key, counter in hourly_minute_counts.items():
+        for minute, cnt in counter.items():
+            active_minutes += 1
+            if cnt > peak_count:
+                peak_hour_key, peak_minute, peak_count = hour_key, minute, cnt
+    avg_per_minute = round(total / active_minutes, 2) if active_minutes else 0.0
+    spike_ratio = round(peak_count / avg_per_minute, 1) if avg_per_minute else 0.0
+    if peak_count == 0:
+        pattern_label = "no timestamped traffic"
+    elif spike_ratio >= 8:
+        pattern_label = "short burst/spike pattern"
+    elif avg_per_minute >= 60:
+        pattern_label = "sustained high traffic"
+    else:
+        pattern_label = "steady traffic"
+    traffic_pattern = {
+        "peak_time_utc": f"{peak_hour_key}:{peak_minute:02d}" if peak_count else "",
+        "peak_requests_per_minute": peak_count,
+        "avg_requests_per_minute": avg_per_minute,
+        "spike_ratio": spike_ratio,
+        "active_minutes": active_minutes,
+        "pattern": pattern_label,
+    }
+
     latest_major = chrome_latest_major if chrome_latest_major > 0 else estimate_latest_chrome_major()
     user_agent_analysis = analyze_chrome_versions(
         chrome_majors,
@@ -1152,6 +1388,8 @@ def summarize_app(
         "total_requests": total,
         "top_countries": countries.most_common(10),
         "top_ip_subnets": top_ip_subnets,
+        "top_ips": top_ips,
+        "traffic_pattern": traffic_pattern,
         "top_endpoints": endpoints.most_common(10),
         "top_non_browser_user_agents": ua_non_browser.most_common(10),
         "user_agent_analysis": user_agent_analysis,
@@ -1319,85 +1557,239 @@ def render_investigation_actions(
     fpm_analysis: dict | None,
     oom_analysis: dict | None,
     request_threshold: int,
+    php_slow_analysis: dict | None = None,
+    mysql_slow_analysis: dict | None = None,
 ) -> list[str]:
-    """Turn measured signals into review actions without making causal claims."""
+    """Turn measured signals into verdicts and review actions without making causal claims."""
     out = ["", "=" * 80, "Investigation Summary & Recommended Actions", "=" * 80]
     findings = 0
+    mysql_per_db = {}
+    if mysql_slow_analysis:
+        mysql_per_db = {d["db"]: d for d in mysql_slow_analysis.get("per_database", [])}
+    php_per_pool = dict((php_slow_analysis or {}).get("per_pool", []))
 
     for row in top5:
         app = row["app"]
         database = row.get("database_name", "Not detected")
         app_findings = []
+        recommendations = []
+        ddos_signals = []
         total = row.get("total_requests", 0)
         error_count = row.get("error_count", 0)
         error_rate = row.get("error_rate_percent", 0)
         subnets = row.get("top_ip_subnets", [])
+        top_ips = row.get("top_ips", [])
+        pattern = row.get("traffic_pattern", {})
         user_agents = row.get("user_agent_analysis", {})
         query_strings = row.get("query_string_analysis", {})
         fpm = row.get("fpm_breaches") or {}
+        app_slow_php = php_per_pool.get(app, 0)
+        app_slow_db = mysql_per_db.get(database, {}) if database != "Not detected" else {}
 
+        # --- Traffic volume and pattern ---
         if total >= request_threshold:
             app_findings.append(
-                f"WARNING: {total} requests meet the review threshold ({request_threshold}). "
-                "This is a traffic spike signal, not proof of DDoS."
+                f"WARNING: {total} requests meet the review threshold ({request_threshold})."
             )
-        if subnets and total:
+            ddos_signals.append("high volume")
+        if pattern.get("spike_ratio", 0) >= 8 and pattern.get("peak_requests_per_minute", 0) >= 60:
+            app_findings.append(
+                f"WARNING: Burst detected — peak {pattern['peak_requests_per_minute']} req/min at "
+                f"{pattern.get('peak_time_utc', '?')} UTC vs average {pattern.get('avg_requests_per_minute', 0)} req/min "
+                f"(spike ratio {pattern['spike_ratio']}x)."
+            )
+            ddos_signals.append(f"{pattern['spike_ratio']}x traffic spike")
+
+        # --- Culprit sources ---
+        if top_ips and top_ips[0].get("percent_of_total", 0) >= 25:
+            culprit = top_ips[0]
+            app_findings.append(
+                f"CULPRIT IP: {culprit['ip']} ({culprit['country']}) sent {culprit['requests']} requests "
+                f"({culprit['percent_of_total']}% of app traffic)."
+            )
+            recommendations.append(
+                f"Review {culprit['ip']} activity; if abusive, block it at the firewall/WAF."
+            )
+            ddos_signals.append("dominant single IP")
+        elif subnets and total:
             top_subnet = subnets[0]
             subnet_percent = round(top_subnet["requests"] * 100.0 / total, 1)
             if subnet_percent >= 40:
                 app_findings.append(
-                    f"WARNING: {top_subnet['subnet']} sent {top_subnet['requests']} requests "
-                    f"({subnet_percent}% of app traffic). Review this source before applying a WAF/firewall block."
+                    f"CULPRIT SUBNET: {top_subnet['subnet']} sent {top_subnet['requests']} requests "
+                    f"({subnet_percent}% of app traffic) from {top_subnet['unique_ips']} IPs."
                 )
-        if error_rate >= 5 or (error_count >= 50 and error_rate >= 1):
-            app_findings.append(
-                f"CRITICAL: {error_count} 4xx/5xx responses ({error_rate}%). "
-                "Review the top endpoints and application/PHP error logs."
-            )
-        if fpm.get("total_breaches", 0):
-            app_findings.append(
-                f"CRITICAL: {fpm['total_breaches']} PHP-FPM pm.max_children breaches. "
-                f"Investigate slow PHP requests and database {database}; tune FPM only after checking available RAM."
-            )
+                recommendations.append(
+                    f"Review subnet {top_subnet['subnet']} before applying a WAF/firewall block."
+                )
+                ddos_signals.append("dominant subnet")
+
+        # --- Bot / spoofing signals ---
         spoof = user_agents.get("spoofing_indicators", {})
         headless = spoof.get("headless_chrome_requests", 0)
         if headless:
+            app_findings.append(f"WARNING: {headless} HeadlessChrome requests (automation/bot signal).")
+            ddos_signals.append("headless browser traffic")
+        nonexistent = spoof.get("nonexistent_versions", {}).get("requests", 0)
+        obsolete = spoof.get("obsolete_versions", {}).get("requests", 0)
+        if nonexistent + obsolete >= 50:
             app_findings.append(
-                f"WARNING: {headless} HeadlessChrome requests. Review their IPs/endpoints and add a WAF rule only if malicious."
+                f"WARNING: {nonexistent + obsolete} requests use spoofed/obsolete Chrome versions (bot signal)."
             )
+            ddos_signals.append("spoofed user agents")
         query_percent = query_strings.get("percent_of_total", 0)
         if query_percent >= 30:
             app_findings.append(
-                f"REVIEW: {query_percent}% of requests contain query strings. Review top parameters for cache-bypass or abuse patterns."
+                f"REVIEW: {query_percent}% of requests carry query strings — check top parameters for cache-bypass abuse."
+            )
+
+        # --- Errors and resource pressure ---
+        if error_rate >= 5 or (error_count >= 50 and error_rate >= 1):
+            app_findings.append(
+                f"CRITICAL: {error_count} 4xx/5xx responses ({error_rate}%). Review top endpoints and error logs."
+            )
+        if fpm.get("total_breaches", 0):
+            app_findings.append(
+                f"CRITICAL: {fpm['total_breaches']} PHP-FPM pm.max_children breaches — requests queued or dropped."
+            )
+
+        # --- Slow PHP / slow MySQL (measured, not inferred) ---
+        if app_slow_php:
+            app_findings.append(
+                f"SLOW PHP: {app_slow_php} slow PHP-FPM requests logged for pool {app} in this window."
+            )
+            recommendations.append(
+                "Optimize the slow PHP scripts listed in the server-wide slow-PHP section (profiling/caching)."
+            )
+        if app_slow_db.get("count"):
+            app_findings.append(
+                f"SLOW MYSQL: {app_slow_db['count']} slow queries on database {database} "
+                f"(total {app_slow_db['total_time_seconds']}s query time)."
+            )
+            recommendations.append(
+                f"Optimize the top slow queries on database {database} (indexes, query rewrites, object caching)."
+            )
+
+        # --- Verdict ---
+        if len(ddos_signals) >= 3:
+            verdict = f"LIKELY BOT FLOOD / DDoS PATTERN ({', '.join(ddos_signals)})"
+            recommendations.insert(
+                0,
+                "Enable DDoS/bot protection (e.g. Cloudflare proxy with WAF/rate-limit rules) for this domain.",
+            )
+        elif len(ddos_signals) == 2:
+            verdict = f"SUSPICIOUS TRAFFIC — needs manual review ({', '.join(ddos_signals)})"
+            recommendations.insert(
+                0,
+                "Inspect the listed IPs/endpoints; prepare WAF/rate-limit rules if the pattern continues.",
+            )
+        elif app_slow_php or app_slow_db.get("count") or fpm.get("total_breaches", 0):
+            verdict = "APPLICATION/DATABASE BOTTLENECK — optimization needed, traffic looks organic"
+        elif app_findings:
+            verdict = "REVIEW — some signals triggered but no clear attack or bottleneck pattern"
+        else:
+            verdict = ""
+
+        if fpm.get("total_breaches", 0) and not ddos_signals:
+            recommendations.append(
+                "If traffic is legitimate and RAM allows, consider upscaling the server or raising pm.max_children."
             )
 
         if app_findings:
             findings += len(app_findings)
+            out.append("")
             out.append(f"App: {app} | Database: {database}")
+            if verdict:
+                out.append(f" Verdict: {verdict}")
             out.extend(f" - {finding}" for finding in app_findings)
+            if recommendations:
+                out.append(" Recommended actions:")
+                out.extend(f"   * {rec}" for rec in recommendations)
 
+    # --- Server-wide findings ---
+    server_lines = []
     if oom_analysis and oom_analysis.get("oom_kill_count", 0):
         findings += 1
-        out.append(
-            f"CRITICAL: {oom_analysis['oom_kill_count']} OOM kills found server-wide. "
-            "Review the listed killed processes; OOM logs do not reliably map every event to one app/database."
+        killed = ", ".join(f"{p} ({c})" for p, c in (oom_analysis.get("killed_processes") or [])[:3])
+        server_lines.append(
+            f"CRITICAL: {oom_analysis['oom_kill_count']} OOM kills server-wide (top killed: {killed or 'unknown'}). "
+            "The server ran out of memory — consider upscaling RAM or reducing memory usage."
         )
-
-    databases = sorted({row.get("database_name", "Not detected") for row in top5})
-    detected_databases = [name for name in databases if name != "Not detected"]
-    if detected_databases:
-        out.append(
-            "REVIEW: Slow MySQL queries were not analysed by this access-log tool. "
-            f"Enable/query the MySQL slow-query log to verify whether database(s) {', '.join(detected_databases)} are contributing."
+    if mysql_slow_analysis is not None:
+        if mysql_slow_analysis.get("total_slow_queries", 0):
+            findings += 1
+            worst = mysql_slow_analysis.get("per_database", [])
+            worst_desc = ", ".join(
+                f"{d['db']} ({d['count']} queries, {d['total_time_seconds']}s)" for d in worst[:3]
+            )
+            server_lines.append(
+                f"SLOW MYSQL: {mysql_slow_analysis['total_slow_queries']} slow queries found "
+                f"(max {mysql_slow_analysis['max_query_time_seconds']}s). Databases: {worst_desc}."
+            )
+        elif not mysql_slow_analysis.get("log_files_scanned"):
+            server_lines.append(
+                "REVIEW: No MySQL slow-query log found — enable slow_query_log to measure database bottlenecks."
+            )
+    if php_slow_analysis is not None and not php_slow_analysis.get("log_files_scanned"):
+        server_lines.append(
+            "REVIEW: No PHP-FPM slow log found — enable request_slowlog_timeout to measure slow PHP requests."
         )
-    else:
-        out.append(
-            "REVIEW: Slow MySQL queries were not analysed. No database name was detected from the application configuration."
-        )
+    if server_lines:
+        out.append("")
+        out.append("Server-wide:")
+        out.extend(f" - {line}" for line in server_lines)
 
     if findings == 0:
-        out.append("No traffic, error-rate, FPM, or OOM thresholds were triggered in this scan window.")
+        out.append("No traffic, error-rate, FPM, OOM, or slow-log thresholds were triggered in this scan window.")
+    out.append("")
     out.append("Do not automatically block IPs, restart services, or change database settings from this report alone.")
+    return out
+
+
+def render_slow_log_section(php_slow: dict | None, mysql_slow: dict | None) -> list[str]:
+    out = []
+    if php_slow is not None:
+        out.append("=" * 80)
+        out.append("Slow PHP Requests (PHP-FPM slow log)")
+        if php_slow.get("total_slow_requests"):
+            out.append(f"Total slow requests: {php_slow['total_slow_requests']}")
+            if php_slow.get("first_event"):
+                out.append(f"Window observed: {php_slow['first_event']} -> {php_slow['last_event']}")
+            out.append("Per pool (app):")
+            for pool, cnt in php_slow.get("per_pool", []):
+                out.append(f"  - {pool}: {cnt}")
+            if php_slow.get("top_scripts"):
+                out.append("Top slow scripts:")
+                for script, cnt in php_slow["top_scripts"]:
+                    out.append(f"  - {script}: {cnt}")
+        elif php_slow.get("log_files_scanned"):
+            out.append("No slow PHP requests found in the scan window.")
+        else:
+            out.append("No PHP-FPM slow log files found (request_slowlog_timeout may be disabled).")
+        out.append("")
+    if mysql_slow is not None:
+        out.append("=" * 80)
+        out.append("Slow MySQL Queries (slow-query log)")
+        if mysql_slow.get("total_slow_queries"):
+            out.append(
+                f"Total slow queries: {mysql_slow['total_slow_queries']} "
+                f"(max query time {mysql_slow['max_query_time_seconds']}s)"
+            )
+            out.append("Per database:")
+            for d in mysql_slow.get("per_database", []):
+                out.append(f"  - {d['db']}: {d['count']} queries, {d['total_time_seconds']}s total")
+            if mysql_slow.get("top_queries"):
+                out.append("Top query fingerprints by total time:")
+                for q in mysql_slow["top_queries"][:5]:
+                    out.append(
+                        f"  - [{q['db']}] {q['count']}x, total {q['total_time_seconds']}s, "
+                        f"max {q['max_time_seconds']}s: {q['fingerprint']}"
+                    )
+        elif mysql_slow.get("log_files_scanned"):
+            out.append("No slow MySQL queries found in the scan window.")
+        else:
+            out.append("No MySQL slow-query log files found (slow_query_log may be disabled).")
+        out.append("")
     return out
 
 
@@ -1413,6 +1805,8 @@ def render_report(
     oom_analysis: dict | None = None,
     wp_cron_analysis: dict | None = None,
     request_alert_threshold: int = 500,
+    php_slow_analysis: dict | None = None,
+    mysql_slow_analysis: dict | None = None,
 ):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
@@ -1457,6 +1851,26 @@ def render_report(
                 out.append(f"  {s['subnet']:<28}{s['requests']:>10}{s['unique_ips']:>12}")
         else:
             out.append("  - None found")
+
+        out.append("\nTop Culprit IPs:")
+        if row.get("top_ips"):
+            out.append(f"  {'IP':<42}{'Requests':>10}{'% Total':>9}  Country")
+            for ip_row in row["top_ips"]:
+                out.append(
+                    f"  {ip_row['ip']:<42}{ip_row['requests']:>10}{ip_row['percent_of_total']:>8}%  {ip_row['country']}"
+                )
+        else:
+            out.append("  - None found")
+
+        pattern = row.get("traffic_pattern", {})
+        if pattern:
+            out.append("\nTraffic Pattern:")
+            out.append(f"  Pattern: {pattern.get('pattern', 'unknown')}")
+            out.append(
+                f"  Peak: {pattern.get('peak_requests_per_minute', 0)} req/min at "
+                f"{pattern.get('peak_time_utc') or 'n/a'} UTC | Avg: {pattern.get('avg_requests_per_minute', 0)} req/min "
+                f"| Spike ratio: {pattern.get('spike_ratio', 0)}x"
+            )
 
         out.append("\nTop Endpoints:")
         for k, v in row["top_endpoints"]:
@@ -1589,12 +2003,16 @@ def render_report(
     if fpm_analysis is not None or oom_analysis is not None:
         out.extend(render_fpm_oom_section(fpm_analysis, oom_analysis, only_app=only_app))
 
+    out.extend(render_slow_log_section(php_slow_analysis, mysql_slow_analysis))
+
     out.extend(
         render_investigation_actions(
             top5,
             fpm_analysis,
             oom_analysis,
             request_alert_threshold,
+            php_slow_analysis=php_slow_analysis,
+            mysql_slow_analysis=mysql_slow_analysis,
         )
     )
 
@@ -1706,6 +2124,21 @@ def main():
         "--syslog-glob",
         default="/var/log/syslog*",
         help="Glob for syslog files incl. rotated .gz (default: /var/log/syslog*)",
+    )
+    parser.add_argument(
+        "--skip-slow-logs",
+        action="store_true",
+        help="Skip PHP-FPM slow log and MySQL slow-query log analysis",
+    )
+    parser.add_argument(
+        "--php-slow-glob",
+        default="/var/log/php*slow*log*",
+        help="Glob for PHP-FPM slow logs (default: /var/log/php*slow*log*)",
+    )
+    parser.add_argument(
+        "--mysql-slow-glob",
+        default="/var/log/mysql/mysql-slow.log*",
+        help="Glob for MySQL slow-query logs (default: /var/log/mysql/mysql-slow.log*)",
     )
     parser.add_argument(
         "--from-time",
@@ -1955,6 +2388,32 @@ def main():
         oom_analysis = analyze_oom_events(oom_events, syslog_files)
         oom_analysis["time_window"] = fpm_window_desc
 
+    php_slow_analysis = None
+    mysql_slow_analysis = None
+    if not args.skip_slow_logs:
+        # Same window translation as the FPM/OOM scan: slow logs span months.
+        slow_time_start, slow_time_end = time_start, time_end
+        if args.days is not None and time_start is None and time_end is None:
+            slow_time_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=args.days)
+
+        progress_log(progress, f"Scanning PHP-FPM slow logs ({args.php_slow_glob})")
+        php_slow_events, php_slow_files = scan_php_slow_logs(args.php_slow_glob, slow_time_start, slow_time_end)
+        php_slow_analysis = analyze_php_slow(php_slow_events, php_slow_files)
+        progress_log(
+            progress,
+            f"Found {len(php_slow_events)} slow PHP requests in {len(php_slow_files)} files",
+        )
+
+        progress_log(progress, f"Scanning MySQL slow-query logs ({args.mysql_slow_glob})")
+        mysql_slow_events, mysql_slow_files = scan_mysql_slow_log(
+            args.mysql_slow_glob, slow_time_start, slow_time_end
+        )
+        mysql_slow_analysis = analyze_mysql_slow(mysql_slow_events, mysql_slow_files)
+        progress_log(
+            progress,
+            f"Found {len(mysql_slow_events)} slow MySQL queries in {len(mysql_slow_files)} files",
+        )
+
     if not args.skip_health:
         progress_log(progress, "Starting health checks for top 5 applications")
         for row in top5:
@@ -1995,6 +2454,8 @@ def main():
         "fpm_breach_analysis": fpm_analysis,
         "oom_analysis": oom_analysis,
         "wp_cron_analysis": wp_cron_analysis,
+        "php_slow_analysis": php_slow_analysis,
+        "mysql_slow_analysis": mysql_slow_analysis,
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [
@@ -2016,6 +2477,8 @@ def main():
         oom_analysis=oom_analysis,
         wp_cron_analysis=wp_cron_analysis,
         request_alert_threshold=args.request_alert_threshold,
+        php_slow_analysis=php_slow_analysis,
+        mysql_slow_analysis=mysql_slow_analysis,
     )
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
