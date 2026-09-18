@@ -169,6 +169,22 @@ def colorize_terminal_report(report: str, request_threshold: int, enabled: bool)
     return "\n".join(colored) + "\n"
 
 
+def detect_database_name(app_dir: Path) -> str:
+    """Read a WordPress database name when available; never infer one."""
+    wp_config = app_dir / "public_html" / "wp-config.php"
+    try:
+        content = wp_config.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return "Not detected"
+
+    match = re.search(
+        r"""define\s*\(\s*['"]DB_NAME['"]\s*,\s*['"]([^'"]+)['"]\s*\)""",
+        content,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else "Not detected"
+
+
 def iter_log_lines(path: Path):
     try:
         if path.suffix == ".gz":
@@ -1132,6 +1148,7 @@ def summarize_app(
     return {
         "app": app,
         "app_dir": str(app_dir),
+        "database_name": detect_database_name(app_dir),
         "total_requests": total,
         "top_countries": countries.most_common(10),
         "top_ip_subnets": top_ip_subnets,
@@ -1297,6 +1314,93 @@ def render_fpm_oom_section(fpm: dict | None, oom: dict | None, only_app: str = "
     return out
 
 
+def render_investigation_actions(
+    top5: list[dict],
+    fpm_analysis: dict | None,
+    oom_analysis: dict | None,
+    request_threshold: int,
+) -> list[str]:
+    """Turn measured signals into review actions without making causal claims."""
+    out = ["", "=" * 80, "Investigation Summary & Recommended Actions", "=" * 80]
+    findings = 0
+
+    for row in top5:
+        app = row["app"]
+        database = row.get("database_name", "Not detected")
+        app_findings = []
+        total = row.get("total_requests", 0)
+        error_count = row.get("error_count", 0)
+        error_rate = row.get("error_rate_percent", 0)
+        subnets = row.get("top_ip_subnets", [])
+        user_agents = row.get("user_agent_analysis", {})
+        query_strings = row.get("query_string_analysis", {})
+        fpm = row.get("fpm_breaches") or {}
+
+        if total >= request_threshold:
+            app_findings.append(
+                f"WARNING: {total} requests meet the review threshold ({request_threshold}). "
+                "This is a traffic spike signal, not proof of DDoS."
+            )
+        if subnets and total:
+            top_subnet = subnets[0]
+            subnet_percent = round(top_subnet["requests"] * 100.0 / total, 1)
+            if subnet_percent >= 40:
+                app_findings.append(
+                    f"WARNING: {top_subnet['subnet']} sent {top_subnet['requests']} requests "
+                    f"({subnet_percent}% of app traffic). Review this source before applying a WAF/firewall block."
+                )
+        if error_rate >= 5 or (error_count >= 50 and error_rate >= 1):
+            app_findings.append(
+                f"CRITICAL: {error_count} 4xx/5xx responses ({error_rate}%). "
+                "Review the top endpoints and application/PHP error logs."
+            )
+        if fpm.get("total_breaches", 0):
+            app_findings.append(
+                f"CRITICAL: {fpm['total_breaches']} PHP-FPM pm.max_children breaches. "
+                f"Investigate slow PHP requests and database {database}; tune FPM only after checking available RAM."
+            )
+        spoof = user_agents.get("spoofing_indicators", {})
+        headless = spoof.get("headless_chrome_requests", 0)
+        if headless:
+            app_findings.append(
+                f"WARNING: {headless} HeadlessChrome requests. Review their IPs/endpoints and add a WAF rule only if malicious."
+            )
+        query_percent = query_strings.get("percent_of_total", 0)
+        if query_percent >= 30:
+            app_findings.append(
+                f"REVIEW: {query_percent}% of requests contain query strings. Review top parameters for cache-bypass or abuse patterns."
+            )
+
+        if app_findings:
+            findings += len(app_findings)
+            out.append(f"App: {app} | Database: {database}")
+            out.extend(f" - {finding}" for finding in app_findings)
+
+    if oom_analysis and oom_analysis.get("oom_kill_count", 0):
+        findings += 1
+        out.append(
+            f"CRITICAL: {oom_analysis['oom_kill_count']} OOM kills found server-wide. "
+            "Review the listed killed processes; OOM logs do not reliably map every event to one app/database."
+        )
+
+    databases = sorted({row.get("database_name", "Not detected") for row in top5})
+    detected_databases = [name for name in databases if name != "Not detected"]
+    if detected_databases:
+        out.append(
+            "REVIEW: Slow MySQL queries were not analysed by this access-log tool. "
+            f"Enable/query the MySQL slow-query log to verify whether database(s) {', '.join(detected_databases)} are contributing."
+        )
+    else:
+        out.append(
+            "REVIEW: Slow MySQL queries were not analysed. No database name was detected from the application configuration."
+        )
+
+    if findings == 0:
+        out.append("No traffic, error-rate, FPM, or OOM thresholds were triggered in this scan window.")
+    out.append("Do not automatically block IPs, restart services, or change database settings from this report alone.")
+    return out
+
+
 def render_report(
     top5,
     all_sorted,
@@ -1308,6 +1412,7 @@ def render_report(
     fpm_analysis: dict | None = None,
     oom_analysis: dict | None = None,
     wp_cron_analysis: dict | None = None,
+    request_alert_threshold: int = 500,
 ):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
@@ -1330,6 +1435,7 @@ def render_report(
         out.append("=" * 80)
         out.append(f"Application: {row['app']}")
         out.append(f"Directory: {row['app_dir']}")
+        out.append(f"Database: {row.get('database_name', 'Not detected')}")
         out.append(f"Total Requests: {row['total_requests']}")
         out.append(f"Error Count (4xx+5xx): {row['error_count']}")
         out.append(f"Error Rate: {row['error_rate_percent']}%")
@@ -1482,6 +1588,15 @@ def render_report(
 
     if fpm_analysis is not None or oom_analysis is not None:
         out.extend(render_fpm_oom_section(fpm_analysis, oom_analysis, only_app=only_app))
+
+    out.extend(
+        render_investigation_actions(
+            top5,
+            fpm_analysis,
+            oom_analysis,
+            request_alert_threshold,
+        )
+    )
 
     out.append("=" * 80)
     out.append("All applications by traffic")
@@ -1900,6 +2015,7 @@ def main():
         fpm_analysis=fpm_analysis,
         oom_analysis=oom_analysis,
         wp_cron_analysis=wp_cron_analysis,
+        request_alert_threshold=args.request_alert_threshold,
     )
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
