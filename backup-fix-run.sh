@@ -147,16 +147,28 @@ setup_runtime_reporting() {
     fi
 }
 
+# Retries transient failures (e.g. Cloudflare 522) so completed backups are not lost.
+post_report_payload() {
+    local payload="$1" attempt
+    for attempt in 1 2 3 4 5; do
+        if curl -fsS --connect-timeout 10 --max-time 30 \
+            -X POST "$BACKUP_REPORT_URL" \
+            -H "Authorization: Bearer ${BACKUP_REPORT_TOKEN}" \
+            -H "Content-Type: application/json" --data "$payload" >/dev/null; then
+            return 0
+        fi
+        [[ "$attempt" -lt 5 ]] && { echo -e "${YELLOW}Dashboard report attempt ${attempt}/5 failed; retrying in 20s...${NC}"; sleep 20; }
+    done
+    return 1
+}
+
 send_no_action_report() {
     local hostname completed_at payload
     [[ -n "${BACKUP_REPORT_URL:-}" && -n "${BACKUP_REPORT_TOKEN:-}" ]] || return 0
     hostname=$(hostname -f 2>/dev/null || hostname)
     completed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     payload="{\"serverIp\":\"${BACKUP_SERVER_IP:-unknown}\",\"hostname\":\"${hostname}\",\"status\":\"NO_ACTION\",\"startedAt\":\"${BACKUP_STARTED_AT}\",\"completedAt\":\"${completed_at}\",\"apps\":[]}"
-    if curl -fsS --connect-timeout 10 --max-time 30 \
-        -X POST "$BACKUP_REPORT_URL" \
-        -H "Authorization: Bearer ${BACKUP_REPORT_TOKEN}" \
-        -H "Content-Type: application/json" --data "$payload" >/dev/null; then
+    if post_report_payload "$payload"; then
         echo -e "${GREEN}No-action backup status sent to the central dashboard.${NC}"
     else
         echo -e "${YELLOW}No-action dashboard reporting failed.${NC}"
@@ -766,7 +778,7 @@ json_escape() {
 }
 
 report_backup_result() {
-    local server_ip hostname completed_at items="" item_sep="" app rc app_status last payload
+    local server_ip hostname completed_at items="" item_sep="" app rc app_status last payload report_sent report_attempt
 
     if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
         # This root-owned file supplies BACKUP_REPORT_URL, BACKUP_REPORT_TOKEN,
@@ -797,14 +809,25 @@ report_backup_result() {
     done
     payload="{\"serverIp\":\"$(json_escape "$server_ip")\",\"hostname\":\"$(json_escape "$hostname")\",\"status\":\"$([[ "$FAIL" -eq 0 ]] && echo COMPLETED || echo FAILED)\",\"startedAt\":\"${BACKUP_STARTED_AT}\",\"completedAt\":\"${completed_at}\",\"apps\":[${items}]}"
 
-    if curl -fsS --connect-timeout 10 --max-time 30 \
-        -X POST "$BACKUP_REPORT_URL" \
-        -H "Authorization: Bearer ${BACKUP_REPORT_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "$payload" >/dev/null; then
+    # Retry transient failures (e.g. Cloudflare 522) so completed backups are not lost.
+    report_sent=0
+    for report_attempt in 1 2 3 4 5; do
+        if curl -fsS --connect-timeout 10 --max-time 30 \
+            -X POST "$BACKUP_REPORT_URL" \
+            -H "Authorization: Bearer ${BACKUP_REPORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$payload" >/dev/null; then
+            report_sent=1
+            break
+        fi
+        [[ "$report_attempt" -lt 5 ]] && { echo -e "${YELLOW}Dashboard report attempt ${report_attempt}/5 failed; retrying in 20s...${NC}"; sleep 20; }
+    done
+    if [[ "$report_sent" -eq 1 ]]; then
         echo -e "${GREEN}Backup result sent to the central dashboard.${NC}"
     else
-        echo -e "${YELLOW}Backup reporting failed; the local backup result is still in ${SCRIPT_LOG_FILE}.${NC}"
+        echo -e "${YELLOW}Backup reporting failed after 5 attempts; the local backup result is still in ${SCRIPT_LOG_FILE}.${NC}"
+        echo -e "${YELLOW}Resend manually with the payload below:${NC}"
+        echo "$payload"
     fi
     unset BACKUP_REPORT_TOKEN
 }
