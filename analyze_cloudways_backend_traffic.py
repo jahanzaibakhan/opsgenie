@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
+from urllib.request import Request, urlopen
 
 BROWSER_UA_MARKERS = ("mozilla", "chrome", "chromium", "safari")
 ANSI_RESET = "\033[0m"
@@ -22,6 +23,10 @@ ANSI_BOLD = "\033[1m"
 ANSI_RED = "\033[1;31m"
 ANSI_YELLOW = "\033[1;33m"
 ANSI_CYAN = "\033[1;36m"
+ANSI_GREEN = "\033[1;32m"
+ANSI_MAGENTA = "\033[1;35m"
+ANSI_DIM = "\033[2m"
+SECTION_MARK = "▸ "
 REQUEST_RE = re.compile(r'"([A-Z]+)\s+([^\s"]+)\s+HTTP/[0-9.]+"')
 STATUS_RE = re.compile(r'"\s+(\d{3})\s+')
 IP_RE = re.compile(r'^(\S+)\s')
@@ -139,16 +144,164 @@ def progress_log(enabled: bool, message: str):
         print(f"[{now_utc_iso()}] {message}", file=sys.stderr, flush=True)
 
 
+def truncate(text, width: int) -> str:
+    text = str(text)
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
+
+
+def render_table(headers, rows, align=None, max_widths=None, indent: str = "  ") -> list[str]:
+    """Render a box-drawing table. align: per-column 'l' or 'r' (numbers default right)."""
+    rows = [[str(c) for c in r] for r in rows]
+    ncol = len(headers)
+    if align is None:
+        align = ["l"] + ["r"] * (ncol - 1)
+    if max_widths:
+        rows = [[truncate(c, max_widths[i]) if max_widths[i] else c for i, c in enumerate(r)] for r in rows]
+    widths = [max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(ncol)]
+
+    def fmt(cells):
+        parts = [c.rjust(widths[i]) if align[i] == "r" else c.ljust(widths[i]) for i, c in enumerate(cells)]
+        return indent + "│ " + " │ ".join(parts) + " │"
+
+    def border(left, mid, right):
+        return indent + left + mid.join("─" * (w + 2) for w in widths) + right
+
+    out = [border("┌", "┬", "┐"), fmt(headers), border("├", "┼", "┤")]
+    out.extend(fmt(r) for r in rows)
+    out.append(border("└", "┴", "┘"))
+    return out
+
+
+def section(title: str) -> str:
+    return f"\n{SECTION_MARK}{title}"
+
+
+class IPIntel:
+    """Online ISP/ASN/country enrichment via ip-api.com batch API (free, no key).
+
+    Only the top IPs per app are looked up (one HTTP request per 100 IPs),
+    so this is cheap. Falls back silently when the server is offline.
+    """
+
+    API = "http://ip-api.com/batch?fields=status,message,country,countryCode,isp,org,as,hosting,proxy,query"
+
+    def __init__(self, enabled: bool = True, progress: bool = False):
+        self.enabled = enabled
+        self.progress = progress
+        self.cache: dict[str, dict] = {}
+        self.failed = False
+
+    @staticmethod
+    def _local_info(ip: str) -> dict | None:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return {"country": "Unknown", "cc": "", "isp": "-", "asn": "-", "type": "-"}
+        if addr.is_loopback:
+            return {"country": "Localhost", "cc": "", "isp": "Loopback (this server)", "asn": "-", "type": "Local"}
+        if addr.is_private or addr.is_link_local or addr.is_reserved:
+            return {"country": "Private", "cc": "", "isp": "Private network", "asn": "-", "type": "Local"}
+        return None
+
+    def prefetch(self, ips):
+        pending = []
+        for ip in ips:
+            if ip in self.cache:
+                continue
+            local = self._local_info(ip)
+            if local:
+                self.cache[ip] = local
+            else:
+                pending.append(ip)
+        if not self.enabled or self.failed or not pending:
+            return
+        for i in range(0, len(pending), 100):
+            chunk = pending[i : i + 100]
+            try:
+                req = Request(
+                    self.API,
+                    data=json.dumps(chunk).encode(),
+                    headers={"Content-Type": "application/json", "User-Agent": "cw-traffic-analyzer"},
+                )
+                with urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception as exc:
+                progress_log(self.progress, f"IP intel lookup failed ({exc}); continuing without ISP data")
+                self.failed = True
+                return
+            for item in data:
+                if item.get("status") != "success":
+                    continue
+                if item.get("proxy"):
+                    kind = "Proxy/VPN"
+                elif item.get("hosting"):
+                    kind = "Hosting/DC"
+                else:
+                    kind = "ISP/Residential"
+                self.cache[item["query"]] = {
+                    "country": item.get("country") or "Unknown",
+                    "cc": item.get("countryCode") or "",
+                    "isp": item.get("isp") or item.get("org") or "Unknown",
+                    "asn": (item.get("as") or "-").split(" ")[0],
+                    "type": kind,
+                }
+            progress_log(self.progress, f"IP intel: resolved {len(chunk)} IPs via ip-api.com")
+
+    def get(self, ip: str) -> dict:
+        return self.cache.get(ip) or self._local_info(ip) or {
+            "country": "Unknown", "cc": "", "isp": "Unknown", "asn": "-", "type": "-",
+        }
+
+
 def colorize_terminal_report(report: str, request_threshold: int, enabled: bool) -> str:
     """Add terminal-only emphasis without writing ANSI codes to report files."""
     if not enabled:
         return report
 
+    def color_cell(c: str) -> str:
+        cs = c.strip()
+        is_status = len(cs) == 3 and cs.isdigit()
+        if cs == "Proxy/VPN" or (is_status and cs[0] == "5"):
+            return f"{ANSI_RED}{c}{ANSI_RESET}"
+        if cs == "Hosting/DC" or (is_status and cs[0] == "4"):
+            return f"{ANSI_YELLOW}{c}{ANSI_RESET}"
+        if cs == "ISP/Residential" or (is_status and cs[0] == "2"):
+            return f"{ANSI_GREEN}{c}{ANSI_RESET}"
+        if cs == "Local":
+            return f"{ANSI_DIM}{c}{ANSI_RESET}"
+        if cs.endswith("%"):
+            try:
+                pct = float(cs[:-1])
+            except ValueError:
+                return c
+            if pct >= 20:
+                return f"{ANSI_RED}{c}{ANSI_RESET}"
+            if pct >= 5:
+                return f"{ANSI_YELLOW}{c}{ANSI_RESET}"
+        return c
+
     colored = []
     app_request_line = re.compile(r"^\d+\. .+ - (\d+) requests$")
+    bar = f"{ANSI_DIM}│{ANSI_RESET}"
+    table_header_next = False
     for line in report.splitlines():
+        stripped = line.strip()
+        if stripped[:1] in {"┌", "├", "└"}:
+            table_header_next = stripped.startswith("┌")
+            colored.append(f"{ANSI_DIM}{line}{ANSI_RESET}")
+            continue
+        if stripped.startswith("│"):
+            cells = line.split("│")
+            if table_header_next:
+                table_header_next = False
+                colored.append(bar.join(f"{ANSI_CYAN}{c}{ANSI_RESET}" if c.strip() else c for c in cells))
+            else:
+                colored.append(bar.join(color_cell(c) for c in cells))
+            continue
         request_match = app_request_line.match(line)
-        if request_match and int(request_match.group(1)) >= request_threshold:
+        if line.startswith(SECTION_MARK):
+            colored.append(f"{ANSI_MAGENTA}{ANSI_BOLD}{line}{ANSI_RESET}")
+        elif request_match and int(request_match.group(1)) >= request_threshold:
             colored.append(f"{ANSI_RED}{ANSI_BOLD}{line}{ANSI_RESET}")
         elif (
             line == "Cloudways Backend Access Traffic Summary"
@@ -168,7 +321,7 @@ def colorize_terminal_report(report: str, request_threshold: int, enabled: bool)
             colored.append(f"{ANSI_RED}{ANSI_BOLD}{line}{ANSI_RESET}")
         elif line.strip().startswith("Verdict:") or "WARNING:" in line or "SLOW PHP:" in line or "SLOW MYSQL:" in line:
             colored.append(f"{ANSI_YELLOW}{ANSI_BOLD}{line}{ANSI_RESET}")
-        elif line.startswith("Total Requests:") or line.startswith("Error Count"):
+        elif line.startswith("Total Requests:") or line.startswith("Error Count") or line.startswith("Error Rate"):
             colored.append(f"{ANSI_YELLOW}{line}{ANSI_RESET}")
         elif line.startswith("="):
             colored.append(f"{ANSI_CYAN}{line}{ANSI_RESET}")
@@ -1261,6 +1414,7 @@ def summarize_app(
     log_files,
     geo: GeoResolver,
     progress: bool = False,
+    intel: IPIntel | None = None,
     chrome_latest_major: int = 0,
     chrome_obsolete_margin: int = 40,
     time_start: datetime | None = None,
@@ -1359,21 +1513,61 @@ def summarize_app(
         if progress and processed_ips % 1000 == 0:
             progress_log(progress, f"[{app}] geo-enriched {processed_ips}/{len(ip_hits)} unique IPs")
 
-    top_ip_subnets = [
-        {"subnet": subnet, "requests": cnt, "unique_ips": subnet_unique_ips[subnet]}
-        for subnet, cnt in subnet_hits.most_common(10)
-    ]
+    # Online ISP/country enrichment for the busiest IPs (one batch request).
+    intel = intel or IPIntel(enabled=False)
+    busiest_ips = [ip for ip, _ in ip_hits.most_common(100)]
+    intel.prefetch(busiest_ips)
+
+    def intel_country(ip: str) -> str:
+        info = intel.get(ip)
+        return f"{info['country']} ({info['cc']})" if info["cc"] else info["country"]
+
+    if not geo.enabled and intel.cache:
+        # No local GeoIP DB: approximate countries from the enriched top IPs.
+        countries = Counter()
+        for ip in busiest_ips:
+            countries[intel_country(ip)] += ip_hits[ip]
+
+    def ip_country(ip: str) -> str:
+        label = country_label(geo.lookup(ip))
+        return intel_country(ip) if label == "Unknown" else label
+
+    # Busiest IP per subnet, used to label the subnet's country/ISP.
+    subnet_rep = {}
+    for ip, _ in ip_hits.most_common():
+        sn = subnet_for_ip(ip)
+        if sn and sn not in subnet_rep:
+            subnet_rep[sn] = ip
+    top_subnet_list = subnet_hits.most_common(10)
+    intel.prefetch([subnet_rep[sn] for sn, _ in top_subnet_list if sn in subnet_rep])
+    top_ip_subnets = []
+    for subnet, cnt in top_subnet_list:
+        rep_ip = subnet_rep.get(subnet, "")
+        info = intel.get(rep_ip)
+        top_ip_subnets.append({
+            "subnet": subnet,
+            "requests": cnt,
+            "percent_of_total": round(cnt * 100.0 / total, 1) if total else 0.0,
+            "unique_ips": subnet_unique_ips[subnet],
+            "country": ip_country(rep_ip) if rep_ip else "Unknown",
+            "isp": info["isp"],
+            "asn": info["asn"],
+            "type": info["type"],
+        })
 
     # Individual culprit IPs (subnets alone can hide a single abusive host).
-    top_ips = [
-        {
+    top_ips = []
+    for ip, cnt in ip_hits.most_common(10):
+        info = intel.get(ip)
+        top_ips.append({
             "ip": ip,
             "requests": cnt,
             "percent_of_total": round(cnt * 100.0 / total, 1) if total else 0.0,
-            "country": country_label(geo.lookup(ip)),
-        }
-        for ip, cnt in ip_hits.most_common(10)
-    ]
+            "country": ip_country(ip),
+            "isp": info["isp"],
+            "asn": info["asn"],
+            "type": info["type"],
+        })
 
     # Traffic pattern: compare the busiest minute against the average minute to
     # distinguish a short burst from a sustained flood.
@@ -1844,12 +2038,15 @@ def render_report(
     request_alert_threshold: int = 500,
     php_slow_analysis: dict | None = None,
     mysql_slow_analysis: dict | None = None,
+    ip_intel_status: str = "",
 ):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
     out.append(f"Generated: {now_utc_iso()}")
     out.append(f"Roots scanned: {', '.join(str(r) for r in roots)}")
     out.append(f"GeoIP backend: {geo_backend}")
+    if ip_intel_status:
+        out.append(f"IP intel (ISP/ASN): {ip_intel_status}")
     if time_window_desc:
         out.append(f"Time window: {time_window_desc}")
     out.append("")
@@ -1860,6 +2057,15 @@ def render_report(
         out.append("Top 5 applications by total traffic")
     for idx, row in enumerate(top5, 1):
         out.append(f"{idx}. {row['app']} - {row['total_requests']} requests")
+    if top5:
+        out.extend(render_table(
+            ["#", "App", "Requests", "Errors", "Error %", "Pattern", "Peak/min"],
+            [[i, r["app"], r["total_requests"], r["error_count"], f"{r['error_rate_percent']}%",
+              r.get("traffic_pattern", {}).get("pattern", "-"),
+              r.get("traffic_pattern", {}).get("peak_requests_per_minute", 0)]
+             for i, r in enumerate(top5, 1)],
+            align=["r", "l", "r", "r", "r", "l", "r"],
+        ))
 
     out.append("")
     for row in top5:
@@ -1870,38 +2076,54 @@ def render_report(
         out.append(f"Total Requests: {row['total_requests']}")
         out.append(f"Error Count (4xx+5xx): {row['error_count']}")
         out.append(f"Error Rate: {row['error_rate_percent']}%")
-        out.append("\nDaily Requests & Avg Requests/Minute:")
-        for d in row.get("daily_request_stats", []):
-            out.append(
-                f"  - Day {d['day_number']} ({d['file_name']}): "
-                f"{d['requests']} requests, avg/min {d['avg_requests_per_minute']}"
-            )
+        total_req = row["total_requests"] or 1
+        out.append(section("Daily Requests & Avg Requests/Minute"))
+        daily = row.get("daily_request_stats", [])
+        if daily:
+            out.extend(render_table(
+                ["Day", "Log file", "Requests", "Avg/min"],
+                [[d["day_number"], d["file_name"], d["requests"], d["avg_requests_per_minute"]] for d in daily],
+                align=["r", "l", "r", "r"],
+            ))
 
-        out.append("\nTop Countries:")
-        for k, v in row["top_countries"]:
-            out.append(f"  - {k}: {v}")
-
-        out.append("\nTop IP Subnets (/24 IPv4, /48 IPv6):")
-        if row["top_ip_subnets"]:
-            out.append(f"  {'Subnet':<28}{'Requests':>10}{'Unique IPs':>12}")
-            for s in row["top_ip_subnets"]:
-                out.append(f"  {s['subnet']:<28}{s['requests']:>10}{s['unique_ips']:>12}")
+        out.append(section("Top Countries"))
+        if row["top_countries"]:
+            out.extend(render_table(
+                ["Country", "Requests", "% Total"],
+                [[k, v, f"{v * 100.0 / total_req:.1f}%"] for k, v in row["top_countries"]],
+            ))
         else:
             out.append("  - None found")
 
-        out.append("\nTop Culprit IPs:")
+        out.append(section("Top IP Subnets (/24 IPv4, /48 IPv6)"))
+        if row["top_ip_subnets"]:
+            out.extend(render_table(
+                ["Subnet", "Requests", "% Total", "IPs", "Country", "ISP / Org", "ASN", "Type"],
+                [[s["subnet"], s["requests"], f"{s.get('percent_of_total', 0)}%", s["unique_ips"],
+                  s.get("country", "Unknown"), s.get("isp", "Unknown"), s.get("asn", "-"), s.get("type", "-")]
+                 for s in row["top_ip_subnets"]],
+                align=["l", "r", "r", "r", "l", "l", "l", "l"],
+                max_widths=[24, 0, 0, 0, 24, 32, 0, 0],
+            ))
+        else:
+            out.append("  - None found")
+
+        out.append(section("Top Culprit IPs"))
         if row.get("top_ips"):
-            out.append(f"  {'IP':<42}{'Requests':>10}{'% Total':>9}  Country")
-            for ip_row in row["top_ips"]:
-                out.append(
-                    f"  {ip_row['ip']:<42}{ip_row['requests']:>10}{ip_row['percent_of_total']:>8}%  {ip_row['country']}"
-                )
+            out.extend(render_table(
+                ["IP", "Requests", "% Total", "Country", "ISP / Org", "ASN", "Type"],
+                [[r["ip"], r["requests"], f"{r['percent_of_total']}%", r["country"],
+                  r.get("isp", "Unknown"), r.get("asn", "-"), r.get("type", "-")]
+                 for r in row["top_ips"]],
+                align=["l", "r", "r", "l", "l", "l", "l"],
+                max_widths=[39, 0, 0, 24, 32, 0, 0],
+            ))
         else:
             out.append("  - None found")
 
         pattern = row.get("traffic_pattern", {})
         if pattern:
-            out.append("\nTraffic Pattern:")
+            out.append(section("Traffic Pattern"))
             out.append(f"  Pattern: {pattern.get('pattern', 'unknown')}")
             out.append(
                 f"  Peak: {pattern.get('peak_requests_per_minute', 0)} req/min at "
@@ -1909,20 +2131,27 @@ def render_report(
                 f"| Spike ratio: {pattern.get('spike_ratio', 0)}x"
             )
 
-        out.append("\nTop Endpoints:")
-        for k, v in row["top_endpoints"]:
-            out.append(f"  - {k}: {v}")
+        out.append(section("Top Endpoints"))
+        if row["top_endpoints"]:
+            out.extend(render_table(
+                ["Endpoint", "Requests", "% Total"],
+                [[k, v, f"{v * 100.0 / total_req:.1f}%"] for k, v in row["top_endpoints"]],
+                max_widths=[70, 0, 0],
+            ))
 
-        out.append("\nTop Non-browser User Agents:")
+        out.append(section("Top Non-browser User Agents"))
         if row["top_non_browser_user_agents"]:
-            for k, v in row["top_non_browser_user_agents"]:
-                out.append(f"  - {k}: {v}")
+            out.extend(render_table(
+                ["User-Agent", "Requests"],
+                [[k, v] for k, v in row["top_non_browser_user_agents"]],
+                max_widths=[80, 0],
+            ))
         else:
             out.append("  - None found")
 
         ua = row.get("user_agent_analysis", {})
         spoof = ua.get("spoofing_indicators", {})
-        out.append("\nUser-Agent (Chrome/Chromium) Analysis:")
+        out.append(section("User-Agent (Chrome/Chromium) Analysis"))
         out.append(
             f"  Claimed Chrome traffic: {ua.get('claimed_chrome_requests', 0)} requests "
             f"({ua.get('claimed_chrome_percent', 0)}%)"
@@ -1953,38 +2182,34 @@ def render_report(
             out.append(f"    - HeadlessChrome: {spoof['headless_chrome_requests']} requests")
         if ua.get("top_major_versions"):
             out.append("  Top claimed Chrome majors:")
-            for ver, cnt in ua["top_major_versions"]:
-                out.append(f"    - {ver}: {cnt}")
+            out.extend(render_table(["Version", "Requests"], ua["top_major_versions"], indent="    "))
 
         qs = row.get("query_string_analysis", {})
-        out.append("\nQuery String Analysis:")
+        out.append(section("Query String Analysis"))
         out.append(
             f"  Requests with query strings: {qs.get('requests_with_query_string', 0)} "
             f"({qs.get('percent_of_total', 0)}% of total)"
         )
         if qs.get("top_parameters"):
             out.append(f"  Distinct parameters seen: {qs.get('distinct_parameters', 0)}")
-            out.append(f"  {'Parameter':<44}{'Hits':>8}")
-            for name, hits in qs["top_parameters"]:
-                out.append(f"  {name:<44}{hits:>8}")
+            out.extend(render_table(["Parameter", "Hits"], qs["top_parameters"], max_widths=[50, 0]))
         else:
             out.append("  - No query string traffic found")
 
-        out.append("\nHourly Traffic (requests/minute stats + unique IPs):")
+        out.append(section("Hourly Traffic (requests/minute stats + unique IPs)"))
         hourly = row.get("hourly_traffic", [])
         if hourly:
-            out.append(f"  {'Hour':<20}{'Min/min':>9}{'Avg/min':>9}{'Max/min':>9}{'Total':>10}{'Unique IPs':>12}")
-            for h in hourly:
-                out.append(
-                    f"  {h['hour']:<20}{h['min_per_minute']:>9}{h['avg_per_minute']:>9}"
-                    f"{h['max_per_minute']:>9}{h['total_requests']:>10}{h['unique_ips']:>12}"
-                )
+            out.extend(render_table(
+                ["Hour", "Min/min", "Avg/min", "Max/min", "Total", "Unique IPs"],
+                [[h["hour"], h["min_per_minute"], h["avg_per_minute"], h["max_per_minute"],
+                  h["total_requests"], h["unique_ips"]] for h in hourly],
+            ))
         else:
             out.append("  - No timestamps parsed from logs")
 
         fpm = row.get("fpm_breaches")
         if fpm is not None:
-            out.append(f"\nFPM max_children Breaches (pool {row['app']}):")
+            out.append(section(f"FPM max_children Breaches (pool {row['app']})"))
             if fpm["total_breaches"]:
                 limit = fpm["pool_limits"].get(row["app"], "?")
                 out.append(
@@ -2004,7 +2229,7 @@ def render_report(
 
         cron = row.get("wp_cron")
         if cron:
-            out.append("\nWP-Cron (Cloudways Cron Optimizer): enabled")
+            out.append(section("WP-Cron (Cloudways Cron Optimizer): enabled"))
             out.append(
                 f"  Cron runs: {cron['runs']}, executed events: {cron['executed_events']}, "
                 f"event time: {cron['event_time_seconds']}s, events >10s: {cron['events_over_10s']}"
@@ -2021,9 +2246,12 @@ def render_report(
                     at = f" ({ev['at']})" if ev.get("at") else ""
                     out.append(f"    - {ev['hook']} = {ev['duration_seconds']}s{at}")
 
-        out.append("\nStatus Breakdown:")
-        for code, cnt in row["status_breakdown"]:
-            out.append(f"  - {code}: {cnt}")
+        out.append(section("Status Breakdown"))
+        if row["status_breakdown"]:
+            out.extend(render_table(
+                ["Status", "Requests", "% Total"],
+                [[code, cnt, f"{cnt * 100.0 / total_req:.1f}%"] for code, cnt in row["status_breakdown"]],
+            ))
 
         domain = row.get("domain", "")
         hc = row.get("health_check", {})
@@ -2091,6 +2319,11 @@ def main():
         "--no-color",
         action="store_true",
         help="Disable terminal colors",
+    )
+    parser.add_argument(
+        "--no-ip-lookup",
+        action="store_true",
+        help="Disable online ISP/ASN/country lookup of top IPs (ip-api.com)",
     )
     parser.add_argument("--country-mmdb", default="")
     parser.add_argument("--country-dat", default="")
@@ -2350,6 +2583,7 @@ def main():
     progress_log(progress, "Pass 2/2: enriching top 5 applications")
     geo = GeoResolver(country_db, country_dat, countryv6_dat)
     progress_log(progress, f"Geo backend selected: {geo.backend}")
+    intel = IPIntel(enabled=not args.no_ip_lookup, progress=progress)
     chrome_latest = args.chrome_latest_major if args.chrome_latest_major > 0 else estimate_latest_chrome_major()
     progress_log(
         progress,
@@ -2367,6 +2601,7 @@ def main():
                 row["log_files"],
                 geo,
                 progress=progress,
+                intel=intel,
                 chrome_latest_major=chrome_latest,
                 chrome_obsolete_margin=args.chrome_obsolete_margin,
                 time_start=time_start,
@@ -2526,6 +2761,11 @@ def main():
         request_alert_threshold=args.request_alert_threshold,
         php_slow_analysis=php_slow_analysis,
         mysql_slow_analysis=mysql_slow_analysis,
+        ip_intel_status=(
+            "disabled (--no-ip-lookup)" if args.no_ip_lookup
+            else "unavailable (lookup failed/offline)" if intel.failed
+            else "ip-api.com"
+        ),
     )
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
