@@ -2098,12 +2098,12 @@ def render_report(
         out.append(section("Top IP Subnets (/24 IPv4, /48 IPv6)"))
         if row["top_ip_subnets"]:
             out.extend(render_table(
-                ["Subnet", "Requests", "% Total", "IPs", "Country", "ISP / Org", "ASN", "Type"],
+                ["Subnet", "Requests", "% Total", "IPs", "Country", "ISP / Org", "Type"],
                 [[s["subnet"], s["requests"], f"{s.get('percent_of_total', 0)}%", s["unique_ips"],
-                  s.get("country", "Unknown"), s.get("isp", "Unknown"), s.get("asn", "-"), s.get("type", "-")]
+                  s.get("country", "Unknown"), s.get("isp", "Unknown"), s.get("type", "-")]
                  for s in row["top_ip_subnets"]],
-                align=["l", "r", "r", "r", "l", "l", "l", "l"],
-                max_widths=[24, 0, 0, 0, 24, 32, 0, 0],
+                align=["l", "r", "r", "r", "l", "l", "l"],
+                max_widths=[24, 0, 0, 0, 24, 32, 0],
             ))
         else:
             out.append("  - None found")
@@ -2111,12 +2111,12 @@ def render_report(
         out.append(section("Top Culprit IPs"))
         if row.get("top_ips"):
             out.extend(render_table(
-                ["IP", "Requests", "% Total", "Country", "ISP / Org", "ASN", "Type"],
+                ["IP", "Requests", "% Total", "Country", "ISP / Org", "Type"],
                 [[r["ip"], r["requests"], f"{r['percent_of_total']}%", r["country"],
-                  r.get("isp", "Unknown"), r.get("asn", "-"), r.get("type", "-")]
+                  r.get("isp", "Unknown"), r.get("type", "-")]
                  for r in row["top_ips"]],
-                align=["l", "r", "r", "l", "l", "l", "l"],
-                max_widths=[39, 0, 0, 24, 32, 0, 0],
+                align=["l", "r", "r", "l", "l", "l"],
+                max_widths=[39, 0, 0, 24, 32, 0],
             ))
         else:
             out.append("  - None found")
