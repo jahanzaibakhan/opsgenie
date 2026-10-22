@@ -20,8 +20,8 @@ usage() {
 Usage: disk-cleanup.sh [--full-scan]
 
 Without arguments, the script uses fast mode. It clears the duplicity cache,
-checks /var/log, application log directories, and PM2 log directories for
-oversized logs, and reports disk space before and after cleanup.
+checks /var/log, /var/mail, application log directories, and PM2 log
+directories for oversized logs, and reports disk space before and after cleanup.
 
 --full-scan  Include recursive top-directory and application-size reports, and
              search the entire root filesystem for eligible oversized log files.
@@ -229,7 +229,8 @@ show_top_applications() {
 is_log_file() {
     local path="$1"
     case "$path" in
-        /var/log/*|*.log|*.log.[0-9]*|*.log-????????|*.out|*.err)
+        # /var/mail: local mailboxes (e.g. root's cron mail) grow without rotation.
+        /var/log/*|/var/mail/*|*.log|*.log.[0-9]*|*.log-????????|*.out|*.err)
             return 0
             ;;
         *)
@@ -263,7 +264,7 @@ clean_duplicity_cache() {
 }
 
 truncate_large_logs() {
-    section "Log files larger than 100 MiB"
+    section "Log and mailbox files larger than 100 MiB"
     local file apparent_bytes bytes scan_label
     local count=0
     local -a scan_roots=()
@@ -274,8 +275,9 @@ truncate_large_logs() {
     else
         # Avoid a recursive walk of every application. Known log directories
         # are checked directly, which keeps the default path fast.
-        scan_label="Fast scan: /var/log, application log directories, and PM2 logs"
+        scan_label="Fast scan: /var/log, /var/mail, application log directories, and PM2 logs"
         scan_roots=(/var/log)
+        [[ -d /var/mail ]] && scan_roots+=(/var/mail)
         if [[ -d "$APP_ROOT" ]]; then
             for app_dir in "$APP_ROOT"/*; do
                 [[ -d "$app_dir" ]] || continue
@@ -323,7 +325,7 @@ main() {
     fi
 
     section "Disk cleanup started: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    warning "This script clears only the contents of $DUPLICITY_CACHE and truncates log files over 100 MiB."
+    warning "This script clears only the contents of $DUPLICITY_CACHE and truncates log and mailbox files over 100 MiB."
     warning "It does not remove any of the reported top directories."
     if [[ "$FULL_SCAN" == true ]]; then
         warning "Full-scan mode is enabled; recursive disk and application scans may take time."
