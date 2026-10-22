@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Safely reclaim disk space from duplicity cache and oversized log files.
+# Safely reclaim disk space from duplicity cache, leftover backup SQL dumps,
+# and oversized log files.
 # Fast default: curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash
 # Full audit:   curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash -s -- --full-scan
 
@@ -9,6 +10,8 @@ set -o pipefail
 
 readonly DUPLICITY_CACHE="/home/.duplicity"
 readonly APP_ROOT="/home/master/applications"
+# Failed automated backups leave .sql dumps behind in per-application folders.
+readonly BACKUP_ROOT="/home/backups"
 readonly LOG_LIMIT_BYTES=$((100 * 1024 * 1024))
 FULL_SCAN=false
 declare -a CLEANED_ITEMS=()
@@ -20,7 +23,7 @@ usage() {
 Usage: disk-cleanup.sh [--full-scan]
 
 Without arguments, the script uses fast mode. It clears the duplicity cache,
-checks /var/log, /var/mail, application log directories, and PM2 log
+removes .sql files left by failed backups anywhere under /home/backups, checks /var/log, /var/mail, application log directories, and PM2 log
 directories for oversized logs, and reports disk space before and after cleanup.
 
 --full-scan  Include recursive top-directory and application-size reports, and
@@ -263,6 +266,33 @@ clean_duplicity_cache() {
     fi
 }
 
+clean_backup_sql_files() {
+    section "SQL dump cleanup in $BACKUP_ROOT"
+    if [[ ! -d "$BACKUP_ROOT" ]]; then
+        warning "• No backup directory found at $BACKUP_ROOT."
+        return
+    fi
+
+    local file bytes
+    local count=0
+
+    echo "Checking all folders in $BACKUP_ROOT for .sql files"
+    while IFS= read -r -d '' file; do
+        bytes=$(allocated_file_bytes "$file" || echo 0)
+        if sudo rm -f -- "$file"; then
+            EXPECTED_RECLAIMED_BYTES+=bytes
+            CLEANED_ITEMS+=("$file ($(human_size "$bytes") removed)")
+            success "✓ Removed: $file ($(human_size "$bytes"))"
+            ((count++))
+        else
+            FAILED_ITEMS+=("$file")
+            error "ERROR: Could not remove: $file"
+        fi
+    done < <(sudo find "$BACKUP_ROOT" -xdev -type f -iname '*.sql' -print0 2>/dev/null)
+
+    (( count > 0 )) || warning "• No qualifying .sql files found."
+}
+
 truncate_large_logs() {
     section "Log and mailbox files larger than 100 MiB"
     local file apparent_bytes bytes scan_label
@@ -325,7 +355,7 @@ main() {
     fi
 
     section "Disk cleanup started: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    warning "This script clears only the contents of $DUPLICITY_CACHE and truncates log and mailbox files over 100 MiB."
+    warning "This script clears only the contents of $DUPLICITY_CACHE, removes .sql files from all folders in $BACKUP_ROOT, and truncates log and mailbox files over 100 MiB."
     warning "It does not remove any of the reported top directories."
     if [[ "$FULL_SCAN" == true ]]; then
         warning "Full-scan mode is enabled; recursive disk and application scans may take time."
@@ -347,6 +377,7 @@ main() {
     fi
 
     clean_duplicity_cache
+    clean_backup_sql_files
     truncate_large_logs
 
     section "Cleanup details"
