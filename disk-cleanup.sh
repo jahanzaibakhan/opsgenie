@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
 # Safely reclaim disk space from duplicity cache, leftover backup SQL dumps,
-# oversized application caches (WordPress, Magento, Laravel), and oversized
-# log files.
+# and oversized log files. Optionally clears oversized application caches
+# (WordPress, Magento, Laravel).
 # Fast default: curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash
 # Full audit:   curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash -s -- --full-scan
+# App caches:   curl -fsSL https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh | bash -s -- --clear-app-cache
 
 set -u
 set -o pipefail
@@ -17,25 +18,24 @@ readonly LOG_LIMIT_BYTES=$((100 * 1024 * 1024))
 # An application's cache is cleared only when it is larger than this.
 readonly CACHE_LIMIT_BYTES=$((100 * 1024 * 1024))
 FULL_SCAN=false
-SKIP_APP_CACHE=false
+CLEAR_APP_CACHE=false
 declare -a CLEANED_ITEMS=()
 declare -a FAILED_ITEMS=()
 declare -i EXPECTED_RECLAIMED_BYTES=0
 
 usage() {
     cat <<'EOF'
-Usage: disk-cleanup.sh [--full-scan] [--skip-app-cache]
+Usage: disk-cleanup.sh [--full-scan] [--clear-app-cache]
 
 Without arguments, the script uses fast mode. It clears the duplicity cache,
-removes .sql files left by failed backups anywhere under /home/backups, clears
-WordPress, Magento, and Laravel caches larger than 100 MiB, checks /var/log,
-/var/mail, application log directories, and PM2 log directories for oversized
-logs, and reports disk space before and after cleanup.
+removes .sql files left by failed backups anywhere under /home/backups, checks /var/log, /var/mail, application log directories, and PM2 log
+directories for oversized logs, and reports disk space before and after cleanup.
 
---full-scan       Include recursive top-directory and application-size reports,
-                  and search the entire root filesystem for eligible oversized
-                  log files.
---skip-app-cache  Do not clear WordPress, Magento, or Laravel caches.
+--full-scan        Include recursive top-directory and application-size reports,
+                   and search the entire root filesystem for eligible oversized
+                   log files.
+--clear-app-cache  Also clear WordPress, Magento, and Laravel caches larger than
+                   100 MiB in each application.
 EOF
 }
 
@@ -43,7 +43,7 @@ parse_arguments() {
     while (( $# > 0 )); do
         case "$1" in
             --full-scan) FULL_SCAN=true ;;
-            --skip-app-cache) SKIP_APP_CACHE=true ;;
+            --clear-app-cache) CLEAR_APP_CACHE=true ;;
             -h|--help) usage; exit 0 ;;
             *)
                 error "ERROR: Unknown option: $1"
@@ -497,10 +497,6 @@ clean_laravel_cache() {
 
 clean_application_caches() {
     section "Application caches larger than 100 MiB (WordPress, Magento, Laravel)"
-    if [[ "$SKIP_APP_CACHE" == true ]]; then
-        warning "• Skipped (--skip-app-cache)."
-        return
-    fi
     if [[ ! -d "$APP_ROOT" ]]; then
         warning "• Application directory not found: $APP_ROOT"
         return
@@ -594,7 +590,10 @@ main() {
     fi
 
     section "Disk cleanup started: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    warning "This script clears only the contents of $DUPLICITY_CACHE, removes .sql files from all folders in $BACKUP_ROOT, clears WordPress/Magento/Laravel caches over 100 MiB, and truncates log and mailbox files over 100 MiB."
+    warning "This script clears only the contents of $DUPLICITY_CACHE, removes .sql files from all folders in $BACKUP_ROOT, and truncates log and mailbox files over 100 MiB."
+    if [[ "$CLEAR_APP_CACHE" == true ]]; then
+        warning "App cache mode is enabled; WordPress, Magento, and Laravel caches over 100 MiB will also be cleared."
+    fi
     warning "It does not remove any of the reported top directories."
     if [[ "$FULL_SCAN" == true ]]; then
         warning "Full-scan mode is enabled; recursive disk and application scans may take time."
@@ -617,7 +616,7 @@ main() {
 
     clean_duplicity_cache
     clean_backup_sql_files
-    clean_application_caches
+    [[ "$CLEAR_APP_CACHE" == true ]] && clean_application_caches
     truncate_large_logs
 
     section "Cleanup details"
