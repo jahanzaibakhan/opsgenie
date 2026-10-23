@@ -56,6 +56,7 @@ DISK_PRESSURE_DETAILS=()
 REMARKS=()
 FREQUENCY_HOURS=24
 BACKUP_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+BACKUP_RUN_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || printf '%s-%s%s' "$(date +%s)" "$RANDOM" "$RANDOM")"
 
 # curl | bash has no stdin TTY — always talk to the real terminal when present.
 TTY="/dev/tty"
@@ -743,6 +744,7 @@ fi
     printf 'SCRIPT_LOG_FILE=%q\n' "$SCRIPT_LOG_FILE"
     printf 'BACKUP_REPORT_CONFIG=%q\n' "$BACKUP_REPORT_CONFIG"
     printf 'BACKUP_STARTED_AT=%q\n' "$BACKUP_STARTED_AT"
+    printf 'BACKUP_RUN_ID=%q\n' "$BACKUP_RUN_ID"
     printf 'OVERDUE_APPS=('
     for APP in "${OVERDUE_APPS[@]}"; do
         printf ' %q' "$APP"
@@ -777,6 +779,96 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+PROGRESS_FILE="/tmp/opsgenie-backup-progress-${BACKUP_RUN_ID}.json"
+PROGRESS_ENABLED=0
+PROGRESS_SERVER_IP=""
+PROGRESS_HOSTNAME=""
+HEARTBEAT_PID=""
+PROGRESS_APPS=()
+declare -A PROGRESS_STATUS=()
+
+# Live progress is best-effort: one short attempt per update so a slow or
+# unreachable dashboard never delays the backups themselves.
+progress_post() {
+    [[ "$PROGRESS_ENABLED" -eq 1 && -s "$PROGRESS_FILE" ]] || return 0
+    curl -fsS --connect-timeout 5 --max-time 15 -X POST "$BACKUP_REPORT_URL" \
+        -H "Authorization: Bearer ${BACKUP_REPORT_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data-binary @"$PROGRESS_FILE" >/dev/null 2>&1 || true
+}
+
+progress_write() {
+    local status="${1:-RUNNING}" reason="${2:-}" items="" app last tmp
+    for app in "${PROGRESS_APPS[@]}"; do
+        last=$(fact_val "last_backup_${app}")
+        items+="${items:+,}{\"app\":\"$(json_escape "$app")\",\"status\":\"${PROGRESS_STATUS[$app]}\",\"latestBackup\":\"$(json_escape "${last:-n/a}")\"}"
+    done
+    tmp="${PROGRESS_FILE}.tmp"
+    (umask 077; printf '{"runId":"%s","serverIp":"%s","hostname":"%s","status":"%s","startedAt":"%s","completedAt":"%s","apps":[%s]%s}\n' \
+        "$BACKUP_RUN_ID" "$(json_escape "$PROGRESS_SERVER_IP")" "$(json_escape "$PROGRESS_HOSTNAME")" "$status" \
+        "$BACKUP_STARTED_AT" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$items" \
+        "${reason:+,\"reason\":\"$(json_escape "$reason")\"}" > "$tmp") && mv -f "$tmp" "$PROGRESS_FILE"
+}
+
+progress_start() {
+    local app
+    if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
+        # shellcheck disable=SC1090
+        source "$BACKUP_REPORT_CONFIG"
+    fi
+    [[ -n "${BACKUP_REPORT_URL:-}" && -n "${BACKUP_REPORT_TOKEN:-}" ]] || return 0
+    PROGRESS_SERVER_IP="${BACKUP_SERVER_IP:-$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')}"
+    PROGRESS_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+    for app in "$@"; do
+        [[ -n "$app" && -z "${PROGRESS_STATUS[$app]:-}" ]] || continue
+        PROGRESS_APPS+=("$app")
+        PROGRESS_STATUS[$app]="QUEUED"
+    done
+    PROGRESS_ENABLED=1
+    progress_write
+    progress_post
+    # Heartbeat lets the dashboard flag a runner that died without reporting.
+    ( while sleep 300 && kill -0 "$$" 2>/dev/null && [[ -f "$PROGRESS_FILE" ]]; do progress_post; done ) >/dev/null 2>&1 &
+    HEARTBEAT_PID=$!
+    echo -e "${CYAN}Live progress is being sent to the central dashboard (run ${BACKUP_RUN_ID}).${NC}"
+}
+
+progress_set() {
+    [[ "$PROGRESS_ENABLED" -eq 1 && -n "$1" ]] || return 0
+    [[ -n "${PROGRESS_STATUS[$1]:-}" ]] || PROGRESS_APPS+=("$1")
+    PROGRESS_STATUS[$1]="$2"
+    progress_write
+    progress_post
+}
+
+progress_result() {
+    if [[ "$2" -eq 0 ]]; then progress_set "$1" COMPLETED; else progress_set "$1" FAILED; fi
+}
+
+progress_stop() {
+    [[ -n "$HEARTBEAT_PID" ]] && pkill -P "$HEARTBEAT_PID" 2>/dev/null
+    [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null
+    HEARTBEAT_PID=""
+    rm -f "$PROGRESS_FILE" "${PROGRESS_FILE}.tmp"
+    return 0
+}
+
+on_runner_interrupt() {
+    local app
+    trap - INT TERM HUP
+    trap '' PIPE
+    if [[ "$PROGRESS_ENABLED" -eq 1 ]]; then
+        [[ -n "$HEARTBEAT_PID" ]] && pkill -P "$HEARTBEAT_PID" 2>/dev/null
+        [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null
+        for app in "${PROGRESS_APPS[@]}"; do
+            case "${PROGRESS_STATUS[$app]}" in QUEUED|RUNNING) PROGRESS_STATUS[$app]="FAILED" ;; esac
+        done
+        progress_write FAILED "Backup runner was interrupted before finishing (screen closed or process killed)"
+        progress_post
+    fi
+    exit 130
+}
+
 report_backup_result() {
     local server_ip hostname completed_at items="" item_sep="" app rc app_status last payload report_sent report_attempt
 
@@ -807,7 +899,7 @@ report_backup_result() {
         item_sep="${items:+,}"
         items+="${item_sep}{\"app\":\"$(json_escape "$app")\",\"status\":\"${app_status}\",\"latestBackup\":\"$(json_escape "${last:-n/a}")\"}"
     done
-    payload="{\"serverIp\":\"$(json_escape "$server_ip")\",\"hostname\":\"$(json_escape "$hostname")\",\"status\":\"$([[ "$FAIL" -eq 0 ]] && echo COMPLETED || echo FAILED)\",\"startedAt\":\"${BACKUP_STARTED_AT}\",\"completedAt\":\"${completed_at}\",\"apps\":[${items}]}"
+    payload="{\"runId\":\"${BACKUP_RUN_ID}\",\"serverIp\":\"$(json_escape "$server_ip")\",\"hostname\":\"$(json_escape "$hostname")\",\"status\":\"$([[ "$FAIL" -eq 0 ]] && echo COMPLETED || echo FAILED)\",\"startedAt\":\"${BACKUP_STARTED_AT}\",\"completedAt\":\"${completed_at}\",\"apps\":[${items}]}"
 
     # Retry transient failures (e.g. Cloudflare 522) so completed backups are not lost.
     report_sent=0
@@ -921,8 +1013,17 @@ echo -e "${BOLD}==================================================${NC}"
 FAIL=0
 declare -a RESULT_APPS RESULT_RC
 
+trap progress_stop EXIT
+trap on_runner_interrupt INT TERM HUP
+if [[ "$FULL_BACKUP" -eq 1 ]]; then
+    progress_start ALL
+else
+    progress_start "${APPS[@]}" "${OVERDUE_APPS[@]}"
+fi
+
 if [[ "$FULL_BACKUP" -eq 1 ]]; then
     echo -e "${YELLOW}No failed apps with data — running full server backup${NC}"
+    progress_set ALL RUNNING
     if sudo "$BACKUP_SCRIPT"; then
         rc=0
     else
@@ -955,9 +1056,11 @@ else
     for APP in "${APPS[@]}"; do
         echo
         echo -e "${CYAN}${BOLD}▶ Failed-app backup ${APP} ...${NC}"
+        progress_set "$APP" RUNNING
         if ! capacity_check_app "$APP"; then
             echo -e "${RED}${BOLD}SKIPPED: ${APP} no longer has sufficient free space for a safe backup.${NC}"
             RESULT_APPS+=("$APP"); RESULT_RC+=("2")
+            progress_set "$APP" SKIPPED
             FAIL=1
             continue
         fi
@@ -968,6 +1071,7 @@ else
             FAIL=1
         fi
         RESULT_APPS+=("$APP"); RESULT_RC+=("$rc")
+        progress_result "$APP" "$rc"
         print_app_report "$APP" "$rc"
     done
 
@@ -979,6 +1083,7 @@ else
             if [[ ! -d "$APPS_PATH/$APP" && ! -d "/var/lib/mysql/$APP" ]]; then
                 echo -e "${RED}${BOLD}REMOVED: ${APP} application and database paths are missing; backup skipped.${NC}"
                 RESULT_APPS+=("$APP"); RESULT_RC+=("3")
+                progress_set "$APP" SKIPPED
                 FAIL=1
                 continue
             fi
@@ -988,9 +1093,11 @@ else
             [[ -n "$DB_SIZE" ]] || DB_SIZE="0B"
             echo -e "${CYAN}Overdue status: ${APP} | Files: ${FILE_SIZE} | DB: ${DB_SIZE} | Eligibility: checking capacity${NC}"
             echo -e "${CYAN}${BOLD}▶ Overdue-app backup ${APP} ...${NC}"
+            progress_set "$APP" RUNNING
             if ! capacity_check_app "$APP"; then
                 echo -e "${RED}${BOLD}SKIPPED: ${APP} no longer has sufficient free space for a safe backup.${NC}"
                 RESULT_APPS+=("$APP"); RESULT_RC+=("2")
+                progress_set "$APP" SKIPPED
                 FAIL=1
                 continue
             fi
@@ -1001,6 +1108,7 @@ else
                 FAIL=1
             fi
             RESULT_APPS+=("$APP"); RESULT_RC+=("$rc")
+            progress_result "$APP" "$rc"
             print_app_report "$APP" "$rc"
         done
     fi
@@ -1033,6 +1141,8 @@ if [[ "$FAIL" -eq 0 ]]; then
 else
     echo -e "${RED}${BOLD}One or more backups failed — see red lines above${NC}"
 fi
+trap - INT TERM HUP
+progress_stop
 report_backup_result
 echo -e "${BOLD}Runner finished $(date '+%Y-%m-%d %H:%M:%S')  fail=${FAIL}${NC}"
 echo -e "${BOLD}==================================================${NC}"
