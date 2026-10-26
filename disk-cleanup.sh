@@ -28,7 +28,9 @@ usage() {
 Usage: disk-cleanup.sh [--full-scan] [--clear-app-cache]
 
 Without arguments, the script uses fast mode. It clears the duplicity cache,
-removes .sql files left by failed backups anywhere under /home/backups, checks /var/log, /var/mail, application log directories, and PM2 log
+removes .sql files left by failed backups anywhere under /home/backups, checks
+/var/log, /var/mail, application log directories, framework logs (Magento
+var/log, Laravel storage/logs, WordPress wp-content/debug.log), and PM2 log
 directories for oversized logs, and reports disk space before and after cleanup.
 
 --full-scan        Include recursive top-directory and application-size reports,
@@ -540,14 +542,27 @@ truncate_large_logs() {
     else
         # Avoid a recursive walk of every application. Known log directories
         # are checked directly, which keeps the default path fast.
-        scan_label="Fast scan: /var/log, /var/mail, application log directories, and PM2 logs"
+        scan_label="Fast scan: /var/log, /var/mail, application and framework log directories, and PM2 logs"
         scan_roots=(/var/log)
         [[ -d /var/mail ]] && scan_roots+=(/var/mail)
         if [[ -d "$APP_ROOT" ]]; then
+            local app_dir log_path
+            local -A seen_apps=()
             for app_dir in "$APP_ROOT"/*; do
-                [[ -d "$app_dir" ]] || continue
-                [[ -d "$app_dir/logs" ]] && scan_roots+=("$app_dir/logs")
-                [[ -d "$app_dir/log" ]] && scan_roots+=("$app_dir/log")
+                # Some application entries are symlinks to another application.
+                app_dir=$(readlink -f -- "$app_dir") || continue
+                [[ -n "${seen_apps[$app_dir]:-}" ]] && continue
+                seen_apps[$app_dir]=1
+                # Application folders are not always readable by the SSH
+                # user, so existence checks go through sudo. Framework logs
+                # live inside the docroot: Magento var/log, Laravel
+                # storage/logs, and the WordPress WP_DEBUG log.
+                for log_path in "$app_dir/logs" "$app_dir/log" \
+                    "$app_dir/public_html/var/log" \
+                    "$app_dir/public_html/storage/logs" \
+                    "$app_dir/public_html/wp-content/debug.log"; do
+                    sudo test -e "$log_path" && scan_roots+=("$log_path")
+                done
             done
         fi
         # PM2 stores logs outside app directories, typically under the
