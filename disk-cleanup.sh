@@ -22,6 +22,7 @@ CLEAR_APP_CACHE=false
 declare -a CLEANED_ITEMS=()
 declare -a FAILED_ITEMS=()
 declare -i EXPECTED_RECLAIMED_BYTES=0
+declare -i OBSERVED_RECLAIMED_BYTES=0
 
 usage() {
     cat <<'EOF'
@@ -116,35 +117,38 @@ show_disk_usage() {
     df -hT 2>/dev/null || df -h
 }
 
-free_space_bytes() {
-    df -PB1 / 2>/dev/null | awk 'NR == 2 { print $4 }'
-}
-
-physical_free_space_bytes() {
-    # df's Available column excludes filesystem blocks reserved for root.
-    # Size - Used reflects all currently unallocated blocks on the filesystem.
-    df -PB1 / 2>/dev/null | awk 'NR == 2 { print $2 - $3 }'
+# Report every local disk filesystem, not only /. Block storage
+# (/mnt/BLOCKSTORAGE) and data disks (/mnt/data, /mnt/db) are separate
+# filesystems that hold application data, backups, or the duplicity cache.
+# In-memory and pseudo filesystems are skipped.
+# Output per line: mount point, space available to non-root users, and
+# physical free space (Size - Used, which includes root-reserved blocks).
+filesystem_free_space() {
+    df -PB1 -x tmpfs -x devtmpfs -x squashfs -x overlay -x vfat -x efivarfs 2>/dev/null |
+        awk 'NR > 1 { print $6 "\t" $4 "\t" ($2 - $3) }'
 }
 
 show_reclaimed_space() {
-    local available_before="$1"
-    local available_after="$2"
-    local physical_before="$3"
-    local physical_after="$4"
+    local mount="$1"
+    local available_before="$2"
+    local available_after="$3"
+    local physical_before="$4"
+    local physical_after="$5"
     local available_reclaimed=$((available_after - available_before))
     local physical_reclaimed=$((physical_after - physical_before))
     local root_reserved=$((physical_after - available_after))
 
+    printf '\n%s%s%s\n' "$C_BOLD" "$mount" "$C_RESET"
     if (( physical_reclaimed > 0 )); then
-        success "✓ Physical disk space reclaimed on /: $(human_size "$physical_reclaimed")"
+        success "✓ Physical disk space reclaimed on $mount: $(human_size "$physical_reclaimed")"
     elif (( physical_reclaimed == 0 )); then
-        warning "• Physical free space on / did not change."
+        warning "• Physical free space on $mount did not change."
     else
-        warning "• Physical free space on / decreased by $(human_size "$((physical_before - physical_after))") while the script ran."
+        warning "• Physical free space on $mount decreased by $(human_size "$((physical_before - physical_after))") while the script ran."
     fi
 
-    success "✓ Physical free space on /: $(human_size "$physical_after")"
-    success "✓ Free space available to non-root users on /: $(human_size "$available_after")"
+    success "✓ Physical free space on $mount: $(human_size "$physical_after")"
+    success "✓ Free space available to non-root users on $mount: $(human_size "$available_after")"
 
     if (( root_reserved > 0 )); then
         warning "• $(human_size "$root_reserved") is reserved or otherwise unavailable to non-root users on this filesystem."
@@ -152,6 +156,23 @@ show_reclaimed_space() {
             warning "• The difference between reclaimed and user-available space is due to that reservation."
         fi
     fi
+}
+
+# Print reclaimed space for each filesystem and store the total physical
+# free-space increase across all of them in OBSERVED_RECLAIMED_BYTES.
+show_reclaimed_space_all() {
+    local before="$1"
+    local after="$2"
+    local mount avail_after phys_after avail_before phys_before
+
+    while IFS=$'\t' read -r mount avail_after phys_after; do
+        [[ -n "$mount" ]] || continue
+        IFS=$'\t' read -r _ avail_before phys_before < <(awk -F '\t' -v m="$mount" '$1 == m' <<< "$before")
+        avail_before=${avail_before:-$avail_after}
+        phys_before=${phys_before:-$phys_after}
+        show_reclaimed_space "$mount" "$avail_before" "$avail_after" "$phys_before" "$phys_after"
+        (( phys_after > phys_before )) && OBSERVED_RECLAIMED_BYTES+=$((phys_after - phys_before))
+    done <<< "$after"
 }
 
 show_deleted_open_files() {
@@ -169,7 +190,9 @@ show_deleted_open_files() {
         awk -v threshold="$threshold" '
             NR > 1 && $7 ~ /^[0-9]+$/ && $7 >= threshold {
                 total += $7
-                print $7 "\t" $1 "\t" $2 "\t" $9
+                name = $10
+                for (i = 11; i <= NF; i++) name = name " " $i
+                print $7 "\t" $1 "\t" $2 "\t" name
             }
             END { if (total > 0) print "TOTAL\t" total }
         ')
@@ -187,16 +210,18 @@ show_deleted_open_files() {
             printf '%-14s %-20s PID %-8s %s\n' "$(human_size "$size")" "$command" "$pid" "$file"
         fi
     done <<< "$output"
+
+    if grep -q $'\tduplicity\t' <<< "$output"; then
+        warning "• duplicity is a running Cloudways backup. The space is freed when it finishes; if it is stuck, check the backup in the Cloudways panel before stopping the process."
+    fi
 }
 
 show_cleanup_reconciliation() {
-    local physical_before="$1"
-    local physical_after="$2"
-    local observed=$((physical_after - physical_before))
+    local observed="$1"
 
     section "Cleanup space reconciliation"
     echo "Allocated blocks cleared: $(human_size "$EXPECTED_RECLAIMED_BYTES")"
-    echo "Observed physical free-space increase: $(human_size "$(( observed > 0 ? observed : 0 ))")"
+    echo "Observed physical free-space increase (all disks): $(human_size "$observed")"
 
     if (( observed + (16 * 1024 * 1024) < EXPECTED_RECLAIMED_BYTES )); then
         warning "• The physical free-space increase is lower than the allocated blocks cleared."
@@ -262,6 +287,16 @@ clean_duplicity_cache() {
     if [[ ! -d "$DUPLICITY_CACHE" ]]; then
         FAILED_ITEMS+=("$DUPLICITY_CACHE (not a directory)")
         error "ERROR: $DUPLICITY_CACHE exists but is not a directory."
+        return
+    fi
+
+    # A running backup keeps its cache files open: deleting them frees no space
+    # until duplicity exits, and can make that backup fail.
+    local pids
+    pids=$(pgrep -x duplicity | paste -sd ' ' -)
+    if [[ -n "$pids" ]]; then
+        warning "• A duplicity backup is running (PID $pids); skipped clearing $DUPLICITY_CACHE."
+        warning "• Re-run this script after the backup finishes."
         return
     fi
 
@@ -537,8 +572,11 @@ truncate_large_logs() {
     local -a scan_roots=()
 
     if [[ "$FULL_SCAN" == true ]]; then
-        scan_label="Full filesystem scan (current filesystem only)"
-        scan_roots=(/)
+        # -xdev keeps each walk on one filesystem, so every local disk
+        # (block storage, data disks) is added as its own root.
+        scan_label="Full filesystem scan (all local disks)"
+        mapfile -t scan_roots < <(filesystem_free_space | cut -f1)
+        (( ${#scan_roots[@]} > 0 )) || scan_roots=(/)
     else
         # Avoid a recursive walk of every application. Known log directories
         # are checked directly, which keeps the default path fast.
@@ -619,9 +657,8 @@ main() {
     warning "Sudo access is required; you may be prompted for your password."
     sudo -v
 
-    local free_before free_after physical_free_before physical_free_after
-    free_before=$(free_space_bytes || echo 0)
-    physical_free_before=$(physical_free_space_bytes || echo 0)
+    local free_before free_after
+    free_before=$(filesystem_free_space)
     section "Disk usage before cleanup"
     show_disk_usage
     if [[ "$FULL_SCAN" == true ]]; then
@@ -648,10 +685,9 @@ main() {
 
     section "Disk usage after cleanup"
     show_disk_usage
-    free_after=$(free_space_bytes || echo 0)
-    physical_free_after=$(physical_free_space_bytes || echo 0)
-    show_reclaimed_space "$free_before" "$free_after" "$physical_free_before" "$physical_free_after"
-    show_cleanup_reconciliation "$physical_free_before" "$physical_free_after"
+    free_after=$(filesystem_free_space)
+    show_reclaimed_space_all "$free_before" "$free_after"
+    show_cleanup_reconciliation "$OBSERVED_RECLAIMED_BYTES"
     if [[ "$FULL_SCAN" == true ]]; then
         show_top_directories "Top 5 largest root-level directories after cleanup"
         show_top_applications "Top 5 largest application directories after cleanup"
