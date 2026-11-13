@@ -21,19 +21,27 @@ main() {
   CONNECT_CMD="${CONNECT_CMD:-cng}"
   local CLEANUP_URL="https://raw.githubusercontent.com/jahanzaibakhan/opsgenie/main/disk-cleanup.sh"
 
-  # cng may be an alias/function from your shell profile -> load it
-  if ! type "${CONNECT_CMD%% *}" >/dev/null 2>&1; then
-    shopt -s expand_aliases
-    local f
-    for f in ~/.bashrc ~/.bash_profile ~/.bash_aliases ~/.profile; do
-      [ -f "$f" ] && source "$f" >/dev/null 2>&1 </dev/null
-    done
+  # cng is usually an alias/function in ~/.bashrc, which only loads in
+  # interactive shells. "curl | bash" is not interactive, so ask an
+  # interactive bash for the definition and import it here.
+  local name="${CONNECT_CMD%% *}" kind
+  if ! type "$name" >/dev/null 2>&1; then
+    kind=$(bash -ic "type -t $name" </dev/null 2>/dev/null | tail -1)
+    case "$kind" in
+      alias)
+        shopt -s expand_aliases
+        eval "$(bash -ic "alias $name" </dev/null 2>/dev/null | grep "^alias $name=" | tail -1)" ;;
+      function)
+        eval "$(bash -ic "declare -f $name" </dev/null 2>/dev/null | sed -n "/^$name ()/,\$p")" ;;
+      file)
+        CONNECT_CMD="$(bash -ic "type -P $name" </dev/null 2>/dev/null | tail -1)${CONNECT_CMD#"$name"}" ;;
+    esac
   fi
   if ! type "${CONNECT_CMD%% *}" >/dev/null 2>&1; then
-    echo "ERROR: '$CONNECT_CMD' not found. Run 'type cng' and pass the real command, e.g.:" >&2
-    echo "  curl -fsSL <url> | CONNECT_CMD='ssh -p 22 root@' bash -s -- servers.txt" >&2
+    echo "ERROR: '$name' not found. Run 'type $name' on this server and share the output." >&2
     return 1
   fi
+  echo "Using: $(type "${CONNECT_CMD%% *}" 2>/dev/null | head -1)" >&2
 
   # ---- Server list ----------------------------------------------------------
   [ $# -eq 0 ] && set -- servers.txt
