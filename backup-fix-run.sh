@@ -97,8 +97,6 @@ can_sudo_n() {
 }
 
 setup_runtime_reporting() {
-    local code server_ip hostname payload response config_tmp
-
     if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
         # shellcheck disable=SC1090
         source "$BACKUP_REPORT_CONFIG"
@@ -111,41 +109,9 @@ setup_runtime_reporting() {
         echo -e "${GREEN}Dashboard reporting enabled with the supplied runtime token.${NC}"
         return 0
     fi
-    echo
-    read -rp "Optional: paste one-time backup dashboard setup code (Enter to skip reporting): " code <"$TTY"
-    [[ -n "$code" ]] || return 0
-
-    server_ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
-    hostname=$(hostname -f 2>/dev/null || hostname)
-    payload="{\"code\":\"${code}\",\"serverIp\":\"${server_ip}\",\"hostname\":\"${hostname}\"}"
-    response=$(curl -fsS --connect-timeout 10 --max-time 30 \
-        -X POST "${BACKUP_REPORT_URL_DEFAULT}/register" \
-        -H "Content-Type: application/json" --data "$payload" 2>/dev/null) || {
-        echo -e "${YELLOW}Dashboard registration failed; backup will run without central reporting.${NC}"
-        return 0
-    }
-    BACKUP_REPORT_TOKEN=$(printf '%s' "$response" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-    if [[ -z "$BACKUP_REPORT_TOKEN" ]]; then
-        echo -e "${YELLOW}Dashboard registration returned no token; backup will run without central reporting.${NC}"
-        return 0
-    fi
-    export BACKUP_REPORT_TOKEN
-    BACKUP_REPORT_URL="${BACKUP_REPORT_URL_DEFAULT}/reports"
-    export BACKUP_REPORT_URL
-    BACKUP_SERVER_IP="$server_ip"
-    config_tmp=$(mktemp)
-    {
-        printf 'BACKUP_REPORT_URL=%q\n' "$BACKUP_REPORT_URL"
-        printf 'BACKUP_REPORT_TOKEN=%q\n' "$BACKUP_REPORT_TOKEN"
-        printf 'BACKUP_SERVER_IP=%q\n' "$BACKUP_SERVER_IP"
-    } > "$config_tmp"
-    if run_priv install -m 0600 -o root -g root "$config_tmp" "$BACKUP_REPORT_CONFIG"; then
-        rm -f "$config_tmp"
-        echo -e "${GREEN}Dashboard reporting is configured for future backup runs.${NC}"
-    else
-        rm -f "$config_tmp"
-        echo -e "${YELLOW}Could not save ${BACKUP_REPORT_CONFIG}; reporting is enabled only for this run.${NC}"
-    fi
+    # No setup-code prompt: reporting is configured by the separate token script
+    # (writes ${BACKUP_REPORT_CONFIG}); without it, the backup runs unreported.
+    return 0
 }
 
 # Retries transient failures (e.g. Cloudflare 522) so completed backups are not lost.
