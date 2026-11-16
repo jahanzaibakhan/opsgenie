@@ -34,7 +34,6 @@ SCREEN_NAME="back"
 RUNNER="/tmp/opsgenie-backup-runner.sh"
 SCRIPT_LOG_DIR="/var/cw/systeam/backup-log"
 SCRIPT_LOG_FILE=""
-BACKUP_REPORT_CONFIG="/etc/backup-reporting.env"
 BACKUP_REPORT_URL_DEFAULT="https://backups.jhanzaib.online/api"
 CPU_THRESHOLD=70
 SWAP_THRESHOLD=50
@@ -96,12 +95,10 @@ can_sudo_n() {
     have_cmd sudo && sudo -n true 2>/dev/null
 }
 
+# Reports only when a token is passed explicitly for this run. /etc/backup-reporting.env
+# is written by the token script for its own crash/reboot watchdog and must never
+# turn a normal run into a reported one.
 setup_runtime_reporting() {
-    if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
-        # shellcheck disable=SC1090
-        source "$BACKUP_REPORT_CONFIG"
-        return 0
-    fi
     if [[ -n "${BACKUP_REPORT_TOKEN:-}" ]]; then
         BACKUP_REPORT_URL="${BACKUP_REPORT_URL:-${BACKUP_REPORT_URL_DEFAULT}/reports}"
         BACKUP_SERVER_IP="${BACKUP_SERVER_IP:-$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')}"
@@ -109,8 +106,7 @@ setup_runtime_reporting() {
         echo -e "${GREEN}Dashboard reporting enabled with the supplied runtime token.${NC}"
         return 0
     fi
-    # No setup-code prompt: reporting is configured by the separate token script
-    # (writes ${BACKUP_REPORT_CONFIG}); without it, the backup runs unreported.
+    echo -e "${CYAN}No dashboard token supplied; this backup will not be reported to the dashboard.${NC}"
     return 0
 }
 
@@ -708,7 +704,6 @@ fi
     printf 'BACKUP_WORK_DIR=%q\n' "$BACKUP_WORK_DIR"
     printf 'SPACE_MULTIPLIER_PERCENT=%q\n' "$SPACE_MULTIPLIER_PERCENT"
     printf 'SCRIPT_LOG_FILE=%q\n' "$SCRIPT_LOG_FILE"
-    printf 'BACKUP_REPORT_CONFIG=%q\n' "$BACKUP_REPORT_CONFIG"
     printf 'BACKUP_STARTED_AT=%q\n' "$BACKUP_STARTED_AT"
     printf 'BACKUP_RUN_ID=%q\n' "$BACKUP_RUN_ID"
     printf 'OVERDUE_APPS=('
@@ -778,10 +773,6 @@ progress_write() {
 
 progress_start() {
     local app
-    if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
-        # shellcheck disable=SC1090
-        source "$BACKUP_REPORT_CONFIG"
-    fi
     [[ -n "${BACKUP_REPORT_URL:-}" && -n "${BACKUP_REPORT_TOKEN:-}" ]] || return 0
     PROGRESS_SERVER_IP="${BACKUP_SERVER_IP:-$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')}"
     PROGRESS_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
@@ -838,17 +829,8 @@ on_runner_interrupt() {
 report_backup_result() {
     local server_ip hostname completed_at items="" item_sep="" app rc app_status last payload report_sent report_attempt
 
-    if [[ -r "$BACKUP_REPORT_CONFIG" ]]; then
-        # This root-owned file supplies BACKUP_REPORT_URL, BACKUP_REPORT_TOKEN,
-        # and optionally BACKUP_SERVER_IP. A registration token is otherwise
-        # inherited in memory from the parent process and never written here.
-        # shellcheck disable=SC1090
-        source "$BACKUP_REPORT_CONFIG"
-    fi
-    if [[ -z "${BACKUP_REPORT_URL:-}" || -z "${BACKUP_REPORT_TOKEN:-}" ]]; then
-        echo -e "${YELLOW}Backup reporting skipped: incomplete ${BACKUP_REPORT_CONFIG}.${NC}"
-        return 0
-    fi
+    # The token is inherited in memory from the parent process only.
+    [[ -n "${BACKUP_REPORT_URL:-}" && -n "${BACKUP_REPORT_TOKEN:-}" ]] || return 0
 
     server_ip="${BACKUP_SERVER_IP:-}"
     if [[ -z "$server_ip" ]]; then
